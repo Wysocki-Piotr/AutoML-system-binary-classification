@@ -1,4 +1,5 @@
 import openml
+import numpy as np
 
 # 1. Get the study suite by its ID (457 corresponds to "OpenML-CC18")
 suite = openml.study.get_suite(457)
@@ -19,6 +20,10 @@ for dataset_id in suite.data:
         print(f"Successfully downloaded: {dataset.name} (ID: {dataset_id})")
         print(f" - Rows: {X.shape[0]}, Columns: {X.shape[1]}")
         
+        if np.unique(y).size != 2:
+            print(f"   Skipping dataset {dataset.name} (ID: {dataset_id}) as it does not have exactly 2 unique target values.")
+            continue
+
         # Optional: Save to CSV
         output_file = f"./Datasets/{dataset.name}_{dataset_id}.csv"
         X.assign(target=y).to_csv(output_file, index=False)
