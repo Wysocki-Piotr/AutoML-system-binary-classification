@@ -1,0 +1,7 @@
+https://huggingface.co/spaces/TabArena/leaderboard
+https://github.com/autogluon/tabarena/tree/main/data/configs
+https://github.com/microsoft/FLAML/blob/main/flaml/default/all/binary.json
+https://github.com/LAMDA-Tabular/TALENT/tree/main/TALENT/configs/default
+Grinsztajn, L., Oyallon, E., & Varoquaux, G. (2022). "Why do tree-based models still outperform deep learning on typical tabular data?".
+Na górze uzasadnienie dlaczego dajemy najwięcej drzewiastych
+Pytanie jak wrzucić do jsona te MLP/tabM ze źródeł, żeby potem je się łatwo odpalało i zgrywało z funkcjami.
