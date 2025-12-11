@@ -12,7 +12,7 @@
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
       "C": 548.858622576932,
-      "solver": "liblinear",
+      "solver": "saga",
       "penalty": "l1"
     }
   },
