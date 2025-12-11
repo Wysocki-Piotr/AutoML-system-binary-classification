@@ -4,8 +4,7 @@
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
       "solver": "lbfgs",
-      "l1_ratio": 0,
-      "max_iter": 5000
+      "penalty": "l2"
     }
   },
   {
@@ -14,7 +13,7 @@
     "params": {
       "C": 548.858622576932,
       "solver": "liblinear",
-      "l1_ratio": 1
+      "penalty": "l1"
     }
   },
   {
@@ -61,25 +60,23 @@
   },
   {
     "name": "extraTree_tabarena_3",
-    "class": "sklearn.ensemble.ExtraTreesRegressor",
+    "class": "sklearn.ensemble.ExtraTreesClassifier",
     "params": {
-      "max_features": 1.0,
-      "max_leaf_nodes": 48567,
-      "min_samples_leaf": 10
+      "max_features": "sqrt",
+      "max_leaf_nodes": 26243,
+      "min_samples_leaf": 4
     }
   },
   {
   "name": "NeuralNetFastAI_TabularFormatmaybeNeeded",
-    "class": "autogluon.tabular.models.fastainn.tabular_nn_fastai.NNFastAiTabularModel",
+    "class": "wrapper.FastAIBinaryClassifier",
     "params": {
-      "hyperparameters": {
         "bs": 2048,
         "emb_drop": 0.4149912327575128,
         "epochs": 20,
         "layers": [400, 200],
         "lr": 0.04711168148637163,
         "ps": 0.5930762171488877
-      }
     }
     },
     {
