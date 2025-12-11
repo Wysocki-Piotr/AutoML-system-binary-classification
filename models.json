@@ -69,7 +69,7 @@
   },
   {
   "name": "NeuralNetFastAI_TabularFormatmaybeNeeded",
-    "class": "wrapper.FastAIBinaryClassifier",
+    "class": "wrappers.FastAIBinaryClassifier.FastAIBinaryClassifier",
     "params": {
         "bs": 2048,
         "emb_drop": 0.4149912327575128,
