@@ -3,7 +3,8 @@
     "name": "log_reg_talent",
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
-      "penalty": "l2",
+      "solver": "lbfgs",
+      "l1_ratio": 0,
       "max_iter": 5000
     }
   },
@@ -12,7 +13,8 @@
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
       "C": 548.858622576932,
-      "penalty": "L1"
+      "solver": "liblinear",
+      "l1_ratio": 1
     }
   },
   {
