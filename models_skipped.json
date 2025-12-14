@@ -1,0 +1,31 @@
+[{
+    "name": "xgboost_TALENT",
+    "class": "xgboost.XGBClassifier",
+    "params": {
+      "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "early_stopping_rounds": 50,
+        "n_estimators": 2000,
+        "tree_method": "hist"
+    }
+  },
+     {
+    "name": "xrfm_default",
+    "class": "xrfm.xRFM",
+    "params": {
+        "bandwidth": 10,
+        "reg": 1e-3,
+        "exponent": 1.0,
+        "p_interp": 0.0,
+        "kernel_type": "l2",
+        "diag": false
+    }
+  },
+   {
+    "name": "tabpfn_classic",
+    "class": "tabpfn.TabPFNClassifier",
+    "params": {
+      "N_ensemble_configurations": 4
+    }
+  }
+]

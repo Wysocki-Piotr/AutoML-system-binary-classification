@@ -1,4 +1,5 @@
 [
+
   {
     "name": "log_reg_talent",
     "class": "sklearn.linear_model.LogisticRegression",
@@ -79,18 +80,7 @@
         "ps": 0.5930762171488877
     }
     },
-    {
-    "name": "xrfm_default",
-    "class": "xrfm.xRFM",
-    "params": {
-        "bandwidth": 10,
-        "reg": 1e-3,
-        "exponent": 1.0,
-        "p_interp": 0.0,
-        "kernel_type": "l2",
-        "diag": false
-    }
-  },
+
   {
     "name": "xgboost_tabarena_1_categorical",
     "class": "xgboost.XGBClassifier",
@@ -171,17 +161,7 @@
         "reg_lambda": 0.05352660657433639
     }
   },
-  {
-    "name": "xgboost_TALENT",
-    "class": "xgboost.XGBClassifier",
-    "params": {
-      "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "early_stopping_rounds": 50,
-        "n_estimators": 2000,
-        "tree_method": "hist"
-    }
-  },
+
   {
     "name": "catboost_tabarena_1",
     "class": "catboost.CatBoostClassifier",
@@ -191,7 +171,8 @@
       "l2_leaf_reg": 3.860757465489678,
       "learning_rate": 0.030421683021409185,
       "max_ctr_complexity": 4,
-      "one_hot_max_size": 10
+      "one_hot_max_size": 10,
+      "verbose": 0
     }
   },
   {
@@ -203,7 +184,8 @@
       "l2_leaf_reg": 2.894432181094842,
       "learning_rate": 0.055078095725390575,
       "max_ctr_complexity": 4,
-      "one_hot_max_size": 10
+      "one_hot_max_size": 10,
+      "verbose": 0
     }
   },
   {
@@ -215,7 +197,8 @@
       "l2_leaf_reg": 3.5835764522666245,
       "learning_rate": 0.018547444999820136,
       "max_ctr_complexity": 1,
-      "one_hot_max_size": 2
+      "one_hot_max_size": 2,
+      "verbose": 0
     }
   },
 {
@@ -224,7 +207,8 @@
     "params": {
       "early_stopping_rounds": 50,
         "n_estimators": 2000,
-        "od_pval": 0.001
+        "od_pval": 0.001,
+      "verbose": 0
     }
   },
   {
@@ -234,7 +218,8 @@
       "feature_fraction": 0.7557067709350109,
       "learning_rate": 0.06271696987383,
       "min_data_in_leaf": 5,
-      "num_leaves": 119
+      "num_leaves": 119,
+       "verbose": -1
     }
   },
   {
@@ -245,7 +230,8 @@
       "feature_fraction": 0.7741382180715835,
       "learning_rate": 0.01581474287513068,
       "min_data_in_leaf": 25,
-      "num_leaves": 86
+      "num_leaves": 86,
+       "verbose": -1
     }
   },
   {
@@ -259,7 +245,8 @@
         "log_max_bin": 8,
         "colsample_bytree": 0.5157078343718623,
         "reg_alpha": 0.045792841240713165,
-        "reg_lambda": 0.0012362651138125363
+        "reg_lambda": 0.0012362651138125363,
+       "verbose": -1
     }
   },
   {
@@ -273,7 +260,8 @@
         "log_max_bin": 9,
         "colsample_bytree": 0.5261441571042451,
         "reg_alpha": 0.002896920833899335,
-        "reg_lambda": 0.0244632475021655943
+        "reg_lambda": 0.0244632475021655943,
+      "verbose": -1
     }
   },
   {
@@ -287,21 +275,16 @@
         "log_max_bin": 10,
         "colsample_bytree": 0.5393339924944204,
         "reg_alpha": 15.800090067239827,
-        "reg_lambda": 34.82471227276953
+        "reg_lambda": 34.82471227276953,
+       "verbose": -1
     }
   },
   {
     "name": "lightgbm_talent",
     "class": "lightgbm.LGBMClassifier",
     "params": {
-       "n_estimators": 2000
-    }
-  },
-  {
-    "name": "tabpfn_classic",
-    "class": "tabpfn.TabPFNClassifier",
-    "params": {
-      "N_ensemble_configurations": 4
+       "n_estimators": 2000,
+       "verbose": -1
     }
   }
 ]

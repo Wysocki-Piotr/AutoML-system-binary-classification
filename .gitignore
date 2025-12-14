@@ -1,0 +1,4 @@
+# --- Pliki tymczasowe Pythona (tego nie chcemy w repo) ---
+catboost_info/
+__pycache__/
+*.py[cod]
