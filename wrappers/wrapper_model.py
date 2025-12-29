@@ -26,6 +26,7 @@ class ModelWrapper:
     def __init__(self, model_config):
         self.model_config = model_config
         self.model = self._initialize_model()
+        self.params = self.model_config.get("params", {}) or {}
 
     def _initialize_model(self):
         fqcn = self.model_config.get("class")
@@ -43,16 +44,12 @@ class ModelWrapper:
             raise ValueError(f"Failed to initialize model {fqcn} with parameters: {params}")
 
     def fit(self, X_train, y_train):
-        # Check if early stopping is enabled
         early_stopping_rounds = self.model_config.get("params", {}).get("early_stopping_rounds", None)
 
         if early_stopping_rounds:
-            # Split the training data into training and validation sets
             X_train_split, X_val, y_train_split, y_val = train_test_split(
                 X_train, y_train, test_size=0.2, random_state=42
             )
-
-            # Fit the model with early stopping
             self.model.fit(
                 X_train_split, y_train_split,
                 eval_set=[(X_val, y_val)],
@@ -60,7 +57,6 @@ class ModelWrapper:
                 verbose=False
             )
         else:
-            # Fit the model without early stopping
             self.model.fit(X_train, y_train)
 
     def predict_proba(self, X):
@@ -71,3 +67,12 @@ class ModelWrapper:
         auc = roc_auc_score(y_test, probs)
         brier = brier_score_loss(y_test, probs)
         return {"auc": auc, "brier": brier}
+
+    def get_params(self, deep=True):
+        """Return model parameters for compatibility with scikit-learn."""
+        return {"class": self.model_config.get("class"), **self.params}
+
+    def set_params(self, **params):
+        """Set model parameters for compatibility with scikit-learn."""
+        self.params.update(params)
+        self.model = self._initialize_model()
