@@ -68,7 +68,10 @@ class SimplePreprocessor:
             raise Exception("Najpierw użyj fit() na zbiorze treningowym!")
         
         X_trans = X.copy()
-        y_trans = y.copy()
+        if y is None:
+            pass
+        else:
+            y_trans = y.copy()
         
         # 1. Numeryczne
         for col in self.num_cols:
@@ -94,11 +97,15 @@ class SimplePreprocessor:
                 X_trans[col] = le.transform(X_trans[col])
 
         # 3. Target
-        if self.y_encoder is None:
+        if y is None:
+            pass
+        elif self.y_encoder is None:
             raise Exception("Nie nauczono encodera dla y (fit wywołano bez y).")
-        y_trans = self.y_encoder.transform(y_trans)
+        else :
+            y_trans = self.y_encoder.transform(y_trans)
+            y=y_trans
         
-        return X_trans, y_trans
+        return X_trans, y
 
     def fit_transform(self, X, y):
         """
