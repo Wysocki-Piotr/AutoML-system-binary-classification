@@ -1,13 +1,18 @@
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from model_main import MiniAutoML
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import balanced_accuracy_score
 
 # Load model configurations from JSON
 cfg = pd.read_json("models.json").to_dict(orient="records")
 
 # Initialize the MiniAutoML system
-automl = MiniAutoML(cfg, metric="brier")
+automl = MiniAutoML(cfg, metric="balanced_accuracy")
 
 # Load dataset
 data = pd.read_csv("Datasets/diabetes_46921.csv")
@@ -41,5 +46,5 @@ probabilities = automl.predict_proba(X_test)
 print("Prediction Probabilities:")
 print(probabilities)
 
-accuracy = accuracy_score(y_test, predictions)
-print(f"Accuracy of predictions: {accuracy:.4f}")
+accuracy = balanced_accuracy_score(y_test, predictions)
+print(f"Balanced accuracy of predictions: {accuracy:.4f}")

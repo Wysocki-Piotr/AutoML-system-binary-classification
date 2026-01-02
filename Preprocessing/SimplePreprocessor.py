@@ -6,10 +6,11 @@ class SimplePreprocessor:
     """
     Najprostszy processing: uzupełnianie braków, skalowanie numerycznych, kodowanie kategorycznych.
     """
-    def __init__(self):
+    def __init__(self, handle_categorical = True):
         # Magazyn wiedzy (statystyki z treningu)
         self.means = {}
         self.modes = {}
+        self.handle_categorical = handle_categorical
         self.cat_encoders = {} # Słownik: {kolumna: {'encoder': le, 'classes': set(...)}}
         self.y_encoder = None
         self.scaler = StandardScaler()
@@ -30,9 +31,9 @@ class SimplePreprocessor:
         self.y_encoder = LabelEncoder()
         self.y_encoder.fit(y)
 
-        # 3. Zmienne Numeryczne: Zapamiętaj średnie i naucz skaler
+        # 3. Zmienne Numeryczne: Zapamiętaj medianę i naucz skaler
         for col in self.num_cols:
-            self.means[col] = X[col].mean()
+            self.means[col] = X[col].median()
         
         # Uczymy skaler na tymczasowej kopii (żeby nie psuć X w miejscu)
         if self.num_cols:
@@ -82,19 +83,24 @@ class SimplePreprocessor:
             X_trans[self.num_cols] = self.scaler.transform(X_trans[self.num_cols])
 
         # 2. Kategoryczne
-        for col in self.cat_cols:
-            if col in X_trans.columns:
-                mode_val = self.modes[col]
-                # Uzupełnianie i rzutowanie
-                X_trans[col] = X_trans[col].fillna(mode_val).astype(str)
-                
-                # Bezpieczne kodowanie (nieznane wartości -> moda)
-                le = self.cat_encoders[col]['encoder']
-                known_classes = self.cat_encoders[col]['classes']
-                
-                # Szybka funkcja mapująca (lambda)
-                X_trans[col] = X_trans[col].apply(lambda x: x if x in known_classes else mode_val)
-                X_trans[col] = le.transform(X_trans[col])
+        if self.handle_categorical:
+            for col in self.cat_cols:
+                if col in X_trans.columns:
+                    mode_val = self.modes[col]
+                    # Uzupełnianie i rzutowanie
+                    X_trans[col] = X_trans[col].fillna(mode_val).astype(str)
+                    
+                    # Bezpieczne kodowanie (nieznane wartości -> moda)
+                    le = self.cat_encoders[col]['encoder']
+                    known_classes = self.cat_encoders[col]['classes']
+                    
+                    # Szybka funkcja mapująca (lambda)
+                    X_trans[col] = X_trans[col].apply(lambda x: x if x in known_classes else mode_val)
+                    X_trans[col] = le.transform(X_trans[col])
+        else:
+            for col in self.cat_cols:
+                if col in X_trans.columns:
+                    X_trans[col] = X_trans[col].fillna(self.modes[col]).astype('category')
 
         # 3. Target
         if y is None:

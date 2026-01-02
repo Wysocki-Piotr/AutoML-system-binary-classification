@@ -1,5 +1,4 @@
 [
-
   {
     "name": "log_reg_talent",
     "class": "sklearn.linear_model.LogisticRegression",
@@ -15,13 +14,6 @@
       "C": 548.858622576932,
       "solver": "saga",
       "penalty": "l1"
-    }
-  },
-  {
-    "name": "knn_talent",
-    "class": "sklearn.neighbors.KNeighborsClassifier",
-    "params": {
-      "weights": "distance"
     }
   },
   {
@@ -190,13 +182,14 @@
     }
   },
 {
-    "name": "catboost_TALENT",
+    "name": "catboost_memento",
     "class": "catboost.CatBoostClassifier",
     "params": {
-      "early_stopping_rounds": 50,
-        "n_estimators": 2000,
-        "od_pval": 0.001,
-      "verbose": 0
+      "iterations": 278,
+        "depth": 9,
+        "l2_leaf_reg": 1.447357,
+      "bagging_temperature": 1.602599,
+      "learning_rate": 0.729353
     }
   },
   {
@@ -268,11 +261,14 @@
     }
   },
   {
-    "name": "lightgbm_talent",
+    "name": "lightgbm_memento",
     "class": "lightgbm.LGBMClassifier",
     "params": {
-       "n_estimators": 2000,
-       "verbose": -1
+       "n_estimators": 9751,
+       "max_depth": 5,
+       "min_child_samples": 3,
+       "learning_rate": 0.003642,
+       "bagging_fraction": 0.735056
     }
   }
 ]
