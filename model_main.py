@@ -1,73 +1,145 @@
 import pandas as pd
 import numpy as np
 import time
+from copy import deepcopy
 from wrappers.wrapper_model import ModelWrapper
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, brier_score_loss, accuracy_score
 from Preprocessing.SimplePreprocessor import SimplePreprocessor
-from sklearn.model_selection import cross_val_score, ParameterSampler
+from sklearn.model_selection import cross_val_score, ParameterSampler, cross_val_predict, StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+
+
+class StackingEnsemble:
+    """
+    Wrapper na Ensemble, który zachowuje się jak pojedynczy model (ma fit/predict).
+    Obsługuje specyficzne preprocessory dla każdego modelu bazowego.
+    """
+
+    def __init__(self, base_models_data, meta_model=None):
+        """
+        :param base_models_data: Lista słowników {'wrapper': ModelWrapper, 'preprocessor': Preprocessor}
+        :param meta_model: Model decyzyjny (np. LogisticRegression). Jeśli None, tworzy domyślny.
+        """
+        self.base_models_data = base_models_data
+        self.meta_model = meta_model if meta_model else LogisticRegression()
+        self.fitted_ = False
+
+    def fit(self, X, y):
+        """
+        Trenuje ensemble:
+        1. Trenuje każdy model bazowy na X (używając jego własnego preprocessora).
+        2. Generuje OOF (Out-of-Fold) predictions dla X.
+        3. Trenuje meta-model na OOF predictions.
+        """
+        meta_features = []
+
+        # 1. Trenowanie modeli bazowych i generowanie OOF dla Meta-Learnera
+        print("  -> Training Ensemble Base Models & Generating OOF predictions...")
+        for item in self.base_models_data:
+            wrapper = item['wrapper']
+            preproc = item['preprocessor']
+
+            # Transformacja danych dedykowana dla tego modelu
+            X_trans, y_trans = preproc.transform(X.copy(), y.copy())
+
+            # Ustawienie parametrów dla specyficznych bibliotek
+            cat_cols = X_trans.select_dtypes(include=['category', 'object']).columns.tolist()
+            if "CatBoost" in wrapper.model.__class__.__name__:
+                wrapper.model.set_params(cat_features=cat_cols)
+            if "XGBClassifier" in wrapper.model.__class__.__name__ and hasattr(wrapper.model, "enable_categorical"):
+                wrapper.model.set_params(enable_categorical=True, tree_method="hist")
+
+            # A) Generowanie OOF predictions (dla meta-modelu)
+            # Używamy cross_val_predict, żeby symulować nieznane dane
+            try:
+                oof_pred = cross_val_predict(
+                    wrapper.model, X_trans, y_trans, cv=5, method="predict_proba", n_jobs=-1
+                )[:, 1]
+            except:
+                # Fallback dla modeli bez predict_proba lub błędów
+                oof_pred = cross_val_predict(
+                    wrapper.model, X_trans, y_trans, cv=5, method="predict", n_jobs=-1
+                )
+            meta_features.append(oof_pred)
+
+            # B) Trenowanie modelu na pełnym zbiorze (do późniejszego predict)
+            wrapper.model.fit(X_trans, y_trans)
+
+        # 2. Trenowanie Meta-Learnera
+        X_meta = np.column_stack(meta_features)
+        self.meta_model.fit(X_meta, y)
+        self.fitted_ = True
+        return self
+
+    def predict(self, X):
+        if not self.fitted_: raise ValueError("Ensemble not fitted")
+        meta_features = self._get_meta_features(X)
+        return self.meta_model.predict(meta_features)
+
+    def predict_proba(self, X):
+        if not self.fitted_: raise ValueError("Ensemble not fitted")
+        meta_features = self._get_meta_features(X)
+        return self.meta_model.predict_proba(meta_features)
+
+    def _get_meta_features(self, X):
+        preds = []
+        for item in self.base_models_data:
+            wrapper = item['wrapper']
+            preproc = item['preprocessor']
+            X_trans, _ = preproc.transform(X.copy(), None)
+            preds.append(wrapper.predict_proba(X_trans)[:, 1])
+        return np.column_stack(preds)
 
 
 class MiniAutoML:
     def __init__(self, models_config, metric="balanced_accuracy"):
-        """
-        Initialize the MiniAutoML system with model configurations and a chosen metric.
-
-        :param models_config: List of model configurations. Each config should ideally contain a 'search_space' key for optimization.
-        :param metric: Metric to evaluate models. Default is 'balanced_accuracy'.
-        """
         self.models_config = models_config
         self.metric = metric
         self.leaderboard = None
-        self.preprocessor = SimplePreprocessor()
+        self.preprocessor = SimplePreprocessor()  # Domyślny, ale Ensemble może go nadpisać
         self.best_model = None
 
     def fit(self, X_train, y_train, cv=5):
-        """
-        Train and evaluate all models, optimize the top 5 using Random Search (max 3 min/model),
-        and select the absolute best model.
-
-        :param X_train: Training features.
-        :param y_train: Training labels.
-        :param cv: Number of cross-validation folds.
-        :return: The best trained model.
-        """
         scores = []
         n_samples, n_features = X_train.shape
 
-        # --- ETAP 1: Wstępna ocena wszystkich modeli (Default Params) ---
+        # ==============================================================================
+        # ETAP 1: SCREENING (Wstępna ocena wszystkich modeli)
+        # ==============================================================================
         print(f"--- Stage 1: Initial Screening of {len(self.models_config)} models ---")
 
         for model_config in self.models_config:
+            # Sprawdzanie ograniczeń wielkości danych
             constraints = model_config.get("constraints", {})
-            max_s = constraints.get("max_samples", float('inf'))
-            max_f = constraints.get("max_features", float('inf'))
-
-            if n_samples > max_s or n_features > max_f:
-                print(f"Skipping {model_config['name']}: Dataset too large ({n_samples}x{n_features})")
+            if n_samples > constraints.get("max_samples", float('inf')) or \
+                    n_features > constraints.get("max_features", float('inf')):
                 continue
 
+            # Wybór preprocessingu
             use_native_cat = "categorical" in model_config["name"] or "CatBoost" in model_config["class"]
             current_preprocessor = SimplePreprocessor(handle_categorical=not use_native_cat)
 
-            # Preprocessing
+            # Preprocessing i init
             X_temp, y_temp = current_preprocessor.fit_transform(X_train.copy(), y_train.copy())
-            cat_cols = X_temp.select_dtypes(include=['category', 'object']).columns.tolist()
-
-            # Inicjalizacja Wrappera
             wrapper = ModelWrapper(model_config)
 
-            # Konfiguracja specyficzna dla bibliotek (CatBoost, XGBoost)
+            # Config specyficzny
+            cat_cols = X_temp.select_dtypes(include=['category', 'object']).columns.tolist()
             if "CatBoost" in model_config["class"]:
                 wrapper.model.set_params(cat_features=cat_cols)
             if use_native_cat and "XGBClassifier" in model_config["class"]:
                 wrapper.model.set_params(enable_categorical=True, tree_method="hist")
 
-            # Cross-validation (Base)
-            cv_scores = cross_val_score(
-                wrapper.model, X_temp, y_temp, cv=cv,
-                scoring=self.metric if self.metric != "balanced_accuracy" else "balanced_accuracy"
-            )
-            mean_score = np.mean(cv_scores)
+            # Ocena (CV)
+            try:
+                cv_scores = cross_val_score(
+                    wrapper.model, X_temp, y_temp, cv=cv,
+                    scoring=self.metric if self.metric != "balanced_accuracy" else "balanced_accuracy"
+                )
+                mean_score = np.mean(cv_scores)
+            except Exception as e:
+                print(f"Error evaluating {model_config['name']}: {e}")
+                continue
 
             scores.append({
                 "Model Name": model_config["name"],
@@ -75,19 +147,20 @@ class MiniAutoML:
                 "Metric Score": mean_score,
                 "Wrapper": wrapper,
                 "Used_Preprocessor": current_preprocessor,
-                "Config": model_config,  # Przechowujemy config do późniejszej optymalizacji
+                "Config": model_config,
                 "Is_Optimized": False,
                 "Params": "Default"
             })
-
             print(f"Model '{model_config['name']}' achieved mean {self.metric}: {mean_score:.4f}")
 
-        # Tworzymy wstępny leaderboard
+        # Wstępny Leaderboard
         self.leaderboard = pd.DataFrame(scores)
         ascending = self.metric == "brier"
         self.leaderboard = self.leaderboard.sort_values(by="Metric Score", ascending=ascending).reset_index(drop=True)
 
-        # --- ETAP 2: Optymalizacja Top 5 (Random Search - Max 3 min) ---
+        # ==============================================================================
+        # ETAP 2: OPTYMALIZACJA (Top 5 modeli)
+        # ==============================================================================
         top_5_models = self.leaderboard.head(5).to_dict('records')
         print("\n" + "=" * 50)
         print(f"--- Stage 2: Optimizing Top {len(top_5_models)} Models (Max 3 min each) ---")
@@ -96,75 +169,47 @@ class MiniAutoML:
             model_config = row["Config"]
             search_space = model_config.get("search_space")
 
-            if not search_space:
-                print(f"Skipping optimization for {model_config['name']} (No search_space defined).")
-                continue
+            if not search_space: continue
 
             print(f"Optimizing {model_config['name']}...")
-
-            # Przygotowanie danych (używamy tego samego preprocessora co w Etapie 1)
             preprocessor = row["Used_Preprocessor"]
             X_temp, y_temp = preprocessor.transform(X_train.copy(), y_train.copy())
 
-            # Inicjalizacja samplera i zmiennych
-            # n_iter ustawione wysoko, bo ogranicza nas czas
+            # Setup Random Search
             param_sampler = ParameterSampler(search_space, n_iter=1000, random_state=42)
-            best_opt_score = row["Metric Score"]  # Startujemy od wyniku bazowego
+            best_opt_score = row["Metric Score"]
             best_opt_params = None
-
             start_time = time.time()
-            time_limit = 180  # 3 minuty w sekundach
+            wrapper = ModelWrapper(model_config)
 
-            # Ręczna pętla Random Search z kontrolą czasu
-            wrapper = ModelWrapper(model_config)  # Nowa instancja
-
-            # Ponowna konfiguracja specyficzna (CatBoost/XGB)
+            # Config specyficzny (ponownie, dla nowej instancji)
             cat_cols = X_temp.select_dtypes(include=['category', 'object']).columns.tolist()
-            if "CatBoost" in model_config["class"]:
-                wrapper.model.set_params(cat_features=cat_cols)
+            if "CatBoost" in model_config["class"]: wrapper.model.set_params(cat_features=cat_cols)
             if "XGBClassifier" in model_config["class"] and "categorical" in model_config["name"]:
                 wrapper.model.set_params(enable_categorical=True, tree_method="hist")
 
-            try:
-                for params in param_sampler:
-                    # Sprawdzenie czasu
-                    if time.time() - start_time > time_limit:
-                        print(f"  -> Time limit reached for {model_config['name']}.")
-                        break
-
-                    # Ustawienie parametrów
-                    try:
-                        wrapper.model.set_params(**params)
-                    except Exception as e:
-                        # Ignoruj błędne parametry
-                        continue
-
-                    # CV
-                    cv_scores_opt = cross_val_score(
+            # Pętla optymalizacyjna
+            for params in param_sampler:
+                if time.time() - start_time > 60: break  # 3 minuty limit
+                try:
+                    wrapper.model.set_params(**params)
+                    cv_s = cross_val_score(
                         wrapper.model, X_temp, y_temp, cv=cv,
                         scoring=self.metric if self.metric != "balanced_accuracy" else "balanced_accuracy"
                     )
-                    mean_opt_score = np.mean(cv_scores_opt)
+                    mean_opt = np.mean(cv_s)
 
-                    # Sprawdzenie czy wynik jest lepszy (zależnie od metryki)
-                    is_better = (mean_opt_score < best_opt_score) if ascending else (mean_opt_score > best_opt_score)
-
+                    is_better = (mean_opt < best_opt_score) if ascending else (mean_opt > best_opt_score)
                     if is_better:
-                        best_opt_score = mean_opt_score
+                        best_opt_score = mean_opt
                         best_opt_params = params
-                        # Kopiujemy najlepszy model (nie tylko params, stan wrappera)
-                        # W sklearn params wystarczą, ale dla pewności w strukturze:
-            except KeyboardInterrupt:
-                print("Optimization interrupted by user.")
+                except:
+                    continue
 
-            # Jeśli znaleziono lepsze parametry, dodaj do leaderboardu
-            if best_opt_params is not None:
-                print(f"  -> Found better params! New score: {best_opt_score:.4f}")
-
-                # Tworzymy nowy wrapper z najlepszymi parametrami
+            if best_opt_params:
+                print(f"  -> Improved! New score: {best_opt_score:.4f}")
                 best_wrapper = ModelWrapper(model_config)
-                if "CatBoost" in model_config["class"]:
-                    best_wrapper.model.set_params(cat_features=cat_cols)
+                if "CatBoost" in model_config["class"]: best_wrapper.model.set_params(cat_features=cat_cols)
                 if "XGBClassifier" in model_config["class"] and "categorical" in model_config["name"]:
                     best_wrapper.model.set_params(enable_categorical=True, tree_method="hist")
 
@@ -180,50 +225,146 @@ class MiniAutoML:
                     "Is_Optimized": True,
                     "Params": str(best_opt_params)
                 })
-            else:
-                print(f"  -> No improvement found within time limit.")
 
-        # --- FINALIZACJA ---
-        # Aktualizacja leaderboardu o wyniki z optymalizacji
+        # Aktualizacja leaderboardu przed Ensemble
         self.leaderboard = pd.DataFrame(scores)
         self.leaderboard = self.leaderboard.sort_values(by="Metric Score", ascending=ascending).reset_index(drop=True)
 
-        # Wybór absolutnie najlepszego modelu
-        best_model_row = self.leaderboard.iloc[0]
-        self.best_model = best_model_row["Wrapper"]
-        self.preprocessor = best_model_row["Used_Preprocessor"]
+        # ==============================================================================
+        # ETAP 3: STACKING ENSEMBLE (Budowanie i Ocena)
+        # ==============================================================================
+        print("\n" + "=" * 50)
+        print("--- Stage 3: Building & Evaluating Stacking Ensemble ---")
 
-        # Ostateczne trenowanie na pełnym zbiorze
-        X_final, y_final = self.preprocessor.transform(X_train.copy(), y_train.copy())
-        self.best_model.fit(X_final, y_final)
+        # Wybór modeli do ensemble (Top 3 unikalne klasy)
+        selected_rows = []
+        seen_classes = set()
+        for _, row in self.leaderboard.iterrows():
+            if row["Model Class"] not in seen_classes:
+                selected_rows.append(row)
+                seen_classes.add(row["Model Class"])
+            if len(selected_rows) >= 3: break
 
-        print("=" * 50)
-        print(f"Best model selected: {best_model_row['Model Name']} with score {best_model_row['Metric Score']:.4f}")
+        # Jeśli za mało unikalnych, dobierz najlepsze z góry
+        if len(selected_rows) < 2:
+            selected_rows = self.leaderboard.head(3).to_dict('records')
+
+        print(f"Ensemble components: {[r['Model Name'] for r in selected_rows]}")
+
+        # Przygotowanie danych dla Ensemble
+        base_models_data = []
+        meta_features_train = []  # Przechowuje predykcje OOF do oceny Ensemble
+
+        for row in selected_rows:
+            # Tworzymy głęboką kopię wrappera (z parametrami)
+            # Musimy stworzyć nową instancję, bo 'row["Wrapper"]' może być użyty gdzie indziej
+            config = row["Config"]
+            wrapper_clone = ModelWrapper(config)
+
+            # Aplikujemy parametry (zoptymalizowane lub default)
+            # Pobieramy parametry z instancji w leaderboardzie, bo ona trzyma stan po RandomSearch
+            current_params = row["Wrapper"].model.get_params()
+            wrapper_clone.model.set_params(**current_params)
+
+            # Preprocessor
+            preproc = row["Used_Preprocessor"]
+            X_trans, y_trans = preproc.transform(X_train.copy(), y_train.copy())
+
+            # Zbieramy OOF predictions dla tego modelu (żeby ocenić jakość Ensemble BEZ wycieku danych)
+            # method='predict_proba' dla klasyfikacji
+            try:
+                oof_pred = cross_val_predict(
+                    wrapper_clone.model, X_trans, y_trans, cv=cv, method="predict_proba", n_jobs=-1
+                )[:, 1]
+            except:
+                oof_pred = cross_val_predict(
+                    wrapper_clone.model, X_trans, y_trans, cv=cv, method="predict", n_jobs=-1
+                )
+
+            meta_features_train.append(oof_pred)
+
+            # Dodajemy do listy składników ensemble (do późniejszego .fit())
+            base_models_data.append({
+                'wrapper': wrapper_clone,
+                'preprocessor': preproc
+            })
+
+        # Ocena Ensemble (Symulacja wyniku za pomocą CV na Meta-Modelu)
+        X_meta = np.column_stack(meta_features_train)
+        meta_learner = LogisticRegression()
+
+        # Szybka ocena meta-modelu (LogReg jest błyskawiczny)
+        ens_cv_scores = cross_val_score(
+            meta_learner, X_meta, y_train, cv=cv,
+            scoring=self.metric if self.metric != "balanced_accuracy" else "balanced_accuracy"
+        )
+        ens_mean_score = np.mean(ens_cv_scores)
+
+        print(f"Ensemble Estimated {self.metric}: {ens_mean_score:.4f}")
+
+        # Dodanie Ensemble do Leaderboardu
+        # Ważne: 'Used_Preprocessor' dajemy None, bo Ensemble sam zarządza preprocessorami swoich dzieci
+        # 'Wrapper' to będzie nasza klasa StackingEnsemble
+        ensemble_instance = StackingEnsemble(base_models_data, meta_learner)
+
+        scores.append({
+            "Model Name": "Stacking Ensemble (Top 3 Unique)",
+            "Model Class": "StackingEnsemble",
+            "Metric Score": ens_mean_score,
+            "Wrapper": ensemble_instance,
+            "Used_Preprocessor": None,  # Specjalny przypadek
+            "Config": {"name": "Ensemble", "class": "Ensemble"},
+            "Is_Optimized": True,
+            "Params": "Meta: LogReg"
+        })
+
+        # ==============================================================================
+        # ETAP 4: FINALIZACJA
+        # ==============================================================================
+        # Sortowanie końcowe
+        self.leaderboard = pd.DataFrame(scores)
+        self.leaderboard = self.leaderboard.sort_values(by="Metric Score", ascending=ascending).reset_index(drop=True)
+
+        best_row = self.leaderboard.iloc[0]
+        self.best_model = best_row["Wrapper"]
+        self.preprocessor = best_row["Used_Preprocessor"]
+
+        print("\n" + "=" * 50)
+        print(f"WINNER: {best_row['Model Name']} with score {best_row['Metric Score']:.4f}")
+        print("Training winner on full dataset...")
+
+        # Trenowanie zwycięzcy
+        if best_row["Model Class"] == "StackingEnsemble":
+            # Ensemble bierze surowe dane i sam robi preprocess wewnątrz
+            self.best_model.fit(X_train, y_train)
+        else:
+            # Pojedynczy model potrzebuje zewnętrznego preprocessora
+            X_final, y_final = self.preprocessor.transform(X_train.copy(), y_train.copy())
+            self.best_model.fit(X_final, y_final)
 
         return self.best_model
 
     def predict(self, X_test):
-        """Return class predictions for the test data."""
-        if not self.best_model:
-            raise ValueError("No model has been trained. Call fit() first.")
+        if not self.best_model: raise ValueError("Call fit() first.")
+
+        # Jeśli wygrał Ensemble, on nie potrzebuje zewnętrznego preprocessora (ma wewnętrzne)
+        if isinstance(self.best_model, StackingEnsemble):
+            return self.best_model.predict(X_test)
+
+        # Jeśli wygrał pojedynczy model
         X_test, _ = self.preprocessor.transform(X_test, None)
         return self.best_model.model.predict(X_test)
 
     def predict_proba(self, X_test):
-        """Return probabilities for the positive class."""
-        if not self.best_model:
-            raise ValueError("No model has been trained. Call fit() first.")
+        if not self.best_model: raise ValueError("Call fit() first.")
+
+        if isinstance(self.best_model, StackingEnsemble):
+            return self.best_model.predict_proba(X_test)[:, 1]
+
         X_test, _ = self.preprocessor.transform(X_test, None)
         return self.best_model.predict_proba(X_test)[:, 1]
 
     def display_leaderboard(self, mode="short"):
-        """Display the leaderboard."""
-        if self.leaderboard is None:
-            raise ValueError("No leaderboard available. Call fit() first.")
-
-        if mode == "short":
-            return self.leaderboard[["Model Name", "Metric Score", "Is_Optimized"]]
-        elif mode == "long":
-            return self.leaderboard
-        else:
-            raise ValueError("Invalid mode. Choose either 'short' or 'long'.")
+        if self.leaderboard is None: raise ValueError("No leaderboard.")
+        cols = ["Model Name", "Metric Score", "Is_Optimized"]
+        return self.leaderboard[cols] if mode == "short" else self.leaderboard

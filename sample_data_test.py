@@ -8,7 +8,7 @@ from model_main import MiniAutoML
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import train_test_split
 
-cfg = pd.read_json("models.json").to_dict(orient="records")
+cfg = pd.read_json("models_new.json").to_dict(orient="records")
 
 automl = MiniAutoML(cfg, metric="balanced_accuracy")
 
