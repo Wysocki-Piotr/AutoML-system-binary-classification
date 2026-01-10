@@ -3,8 +3,10 @@
     "name": "log_reg_talent",
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
-      "solver": "lbfgs",
-      "penalty": "l2"
+      "C": 56.80730601971143,
+      "penalty": "L2",
+      "proc.impute_strategy": "median",
+      "proc.skew_threshold": 0.9
     }
   },
   {
@@ -271,4 +273,5 @@
        "bagging_fraction": 0.735056
     }
   }
+
 ]
