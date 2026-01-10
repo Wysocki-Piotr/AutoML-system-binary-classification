@@ -1,16 +1,15 @@
 [
   {
-    "name": "log_reg_talent",
+    "name": "log_reg_tabarena_1",
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
-      "C": 56.80730601971143,
+      "C": 758.6397627599249,
       "penalty": "L2",
-      "proc.impute_strategy": "median",
-      "proc.skew_threshold": 0.9
+      "proc.impute_strategy": "median"
     }
   },
   {
-    "name": "log_reg_tabarena_median_impute_noskew",
+    "name": "log_reg_tabarena_2",
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
       "C": 548.858622576932,
@@ -275,3 +274,4 @@
   }
 
 ]
+
