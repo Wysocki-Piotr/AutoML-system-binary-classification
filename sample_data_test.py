@@ -9,7 +9,10 @@ from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import train_test_split
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+pd.set_option('display.max_rows', None)
 
+# Wszystkie kolumny
+pd.set_option('display.max_columns', None)
 cfg = pd.read_json("models_new.json").to_dict(orient="records")
 
 automl = MiniAutoML(cfg, metric="balanced_accuracy")
@@ -27,7 +30,7 @@ best_model = automl.fit(X_train, y_train, cv=5)
 
 # Display the leaderboard
 print("Leaderboard:")
-print(automl.display_leaderboard())
+print(automl.display_leaderboard(mode="long"))
 
 # Make predictions on the test set
 predictions = automl.predict(X_test)
