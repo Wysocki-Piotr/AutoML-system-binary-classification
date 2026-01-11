@@ -384,4 +384,6 @@ class MiniAutoML:
     def display_leaderboard(self, mode="short"):
         if self.leaderboard is None: raise ValueError("No leaderboard.")
         cols = ["Model Name", "Metric Score"]
+        print(self.leaderboard[0]["Params"])
+        print("================ Leaderboard ================")
         return self.leaderboard[cols] if mode == "short" else self.leaderboard
