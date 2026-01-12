@@ -1,9 +1,9 @@
 [
   {
-    "name": "log_reg_talent",
+    "name": "log_reg_tabarena_1",
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
-      "solver": "lbfgs",
+      "C": 758.6397627599249,
       "penalty": "l2"
     },
     "search_space": {
