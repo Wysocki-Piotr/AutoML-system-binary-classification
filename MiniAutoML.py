@@ -4,7 +4,7 @@ import time
 import warnings
 from copy import deepcopy
 from sklearn.metrics import balanced_accuracy_score, brier_score_loss, accuracy_score
-from sklearn.model_selection import cross_val_score, ParameterSampler, cross_val_predict, StratifiedKFold
+from sklearn.model_selection import cross_val_score, ParameterSampler, cross_val_predict, KFold, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 # Zakładam, że te importy masz w swoim środowisku, jeśli nie - upewnij się, że pliki istnieją
 from wrappers.wrapper_model import ModelWrapper
@@ -93,7 +93,7 @@ class StackingEnsemble:
         if not self.fitted_: raise ValueError("Ensemble not fitted")
         
         # 1. Globalna transformacja
-        X_trans, _ = self.preprocessor.transform(X_raw.copy(), None)
+        X_trans = self.preprocessor.transform(X_raw.copy(), None)
         # 2. Generowanie cech dla meta-modelu
         meta_features = self._get_meta_features(X_trans)
         
@@ -144,7 +144,7 @@ class MiniAutoML:
         warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
         from sklearn.experimental import enable_halving_search_cv  # noqa
         from sklearn.model_selection import HalvingRandomSearchCV
-
+        cv_stratedy = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
         scores = []
         n_samples, n_features = X_train.shape
         
@@ -198,7 +198,7 @@ class MiniAutoML:
                     wrapper.model,
                     X_current,
                     y_train,
-                    cv=cv,
+                    cv=cv_stratedy,
                     scoring="balanced_accuracy",
                     n_jobs=-1
                 )
@@ -227,7 +227,7 @@ class MiniAutoML:
         # ======================================================================
         print("\n--- Stage 2: Light optimization (Top 3) ---")
 
-        top3 = leaderboard.head(5).to_dict("records")
+        top3 = leaderboard.head(3).to_dict("records")
 
         for row in top3:
             config = row["Config"]
@@ -244,7 +244,7 @@ class MiniAutoML:
                 search = HalvingRandomSearchCV(
                     wrapper.model,
                     search_space,
-                    n_candidates=500,
+                    n_candidates=1000,
                     factor=2,
                     scoring="balanced_accuracy",
                     n_jobs=-1,
@@ -381,6 +381,7 @@ class MiniAutoML:
         ).reset_index(drop=True)
 
         best = leaderboard.iloc[0]
+        self.leaderboard = leaderboard
         self.best_model = best["Wrapper"]
 
         print("\n==============================")
@@ -446,7 +447,7 @@ class MiniAutoML:
 
         # Dla pojedynczego modelu musimy przetworzyć surowe dane
         # Uwaga: używamy transform, nie fit_transform
-        X_test_proc, _ = self.preprocessor.transform(X_test, None)
+        X_test_proc = self.preprocessor.transform(X_test, None)
         
         # Obsługa XGBoost przy predykcji pojedynczego modelu
         cat_cols = self.preprocessor.get_categorical_cols(X_test_proc)
@@ -463,7 +464,7 @@ class MiniAutoML:
         if isinstance(self.best_model, StackingEnsemble):
             return self.best_model.predict_proba(X_test)[:, 1]
 
-        X_test, _ = self.preprocessor.transform(X_test, None)
+        X_test = self.preprocessor.transform(X_test, None)
         return self.best_model.predict_proba(X_test)[:, 1]
 
     def display_leaderboard(self, mode="short"):
