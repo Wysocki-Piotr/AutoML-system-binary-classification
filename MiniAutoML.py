@@ -184,11 +184,6 @@ class MiniAutoML:
 
             if "CatBoost" in model_config["class"] and cat_cols:
                     wrapper.model.set_params(cat_features=cat_cols)
-            elif "XGBClassifier" in model_config["class"] or "LGBMClassifier" in model_config["class"]:
-                # Używamy wersji z typem 'category'
-                X_current = X_train_cat
-                if "XGBClassifier" in model_config["class"]:
-                    wrapper.model.set_params(enable_categorical=True, tree_method="hist")
 
             try:
                 cv_scores = cross_val_score(

@@ -4,8 +4,7 @@
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
       "C": 758.6397627599249,
-      "penalty": "l2",
-      "max_iter": 2000
+      "penalty": "l2"
     },
     "search_space": {
       "C": [0.1, 1.0, 10.0, 100.0, 750.0],
@@ -13,12 +12,12 @@
     }
   },
   {
-    "name": "log_reg_tabarena_median_impute_noskew",
+    "name": "log_reg_tabarena_2",
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
-      "C": 548.858622576932,
-      "solver": "saga",
-      "penalty": "l1"
+      "C": 857.9598230609945,
+      "penalty": "l1",
+      "solver": "saga"
     },
     "search_space": {
       "C": [10, 100,250, 500, 1000],
@@ -98,7 +97,7 @@
     }
   },
   {
-    "name": "xgboost_tabarena_1_categorical",
+    "name": "xgboost_tabarena_1",
     "class": "xgboost.XGBClassifier",
     "params": {
       "colsample_bytree": 0.7744067519636624,
@@ -115,13 +114,13 @@
     }
   },
   {
-    "name": "xgboost_tabarena_2_non_categorical",
+    "name": "xgboost_tabarena_2",
     "class": "xgboost.XGBClassifier",
     "params": {
-      "colsample_bytree": 0.916309922773969,
-      "learning_rate": 0.007613258561745761,
-      "max_depth": 4,
-      "min_child_weight": 1.478618342232764
+      "colsample_bytree": 0.7118273996694524,
+      "learning_rate": 0.01581474287513068,
+      "max_depth": 10,
+      "min_child_weight": 0.5567129773174432
     },
     "search_space": {
       "n_estimators": [200, 500, 800],
