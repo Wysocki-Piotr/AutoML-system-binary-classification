@@ -8,78 +8,117 @@ from sklearn.model_selection import cross_val_score, ParameterSampler, cross_val
 from sklearn.linear_model import LogisticRegression
 # Zakładam, że te importy masz w swoim środowisku, jeśli nie - upewnij się, że pliki istnieją
 from wrappers.wrapper_model import ModelWrapper
-from Preprocessing.SimplePreprocessor import SimplePreprocessor
-
+#from Preprocessing.SimplePreprocessor import SimplePreprocessor
+from Preprocessing.AutoMLPreprocessor import AutoMLPreprocessor
 
 class StackingEnsemble:
-    def __init__(self, base_models, meta_model=None, threshold=0.5, refit_meta=True):
+    def __init__(self, base_models, preprocessor, meta_model=None, threshold=0.5, refit_meta=True):
         """
         :param base_models: Lista słowników {'wrapper': ..., 'preprocessor': ...}
         :param refit_meta: Jeśli False, zakłada, że meta_model jest już wytrenowany
                            i pomija kosztowne generowanie OOF w metodzie fit().
         """
         self.base_models = base_models
+        self.preprocessor = preprocessor
         self.meta_model = meta_model if meta_model else LogisticRegression()
         self.threshold = threshold
         self.refit_meta = refit_meta
         self.fitted_ = False
 
     def fit(self, X, y):
-        # 1. Trenujemy modele bazowe na PEŁNYM zbiorze (to zawsze trzeba zrobić dla nowych danych)
+        """
+        Metoda przyjmuje dane już przetworzone.
+        Nie wykonuje transform(), jedynie dostosowuje typy kolumn dla XGB/LGBM.
+        """
         print("  -> Fitting base models on full dataset...")
-        for item in self.base_models:
-            wrapper = item['wrapper']
-            preproc = item['preprocessor']
+        cat_cols = self.preprocessor.get_categorical_cols(X)
+        
+        for wrapper in self.base_models:
+            # Tworzymy kopię X dla danego modelu, żeby specyficzne rzutowanie nie psuło innych
+            X_model = X.copy()
+            model_name = wrapper.model.__class__.__name__
+            
+            # --- Specyficzna obsługa KATEGORII ---
+            if "CatBoost" in model_name:
+                 wrapper.model.set_params(cat_features=cat_cols)
+            
+            elif ("XGBClassifier" in model_name or "LGBMClassifier" in model_name) and cat_cols:
+                # XGB/LGBM wymagają fizycznego typu 'category'
+                for col in cat_cols:
+                    X_model[col] = X_model[col].astype("category")
+                
+                if "XGBClassifier" in model_name:
+                    wrapper.model.set_params(enable_categorical=True, tree_method="hist")
 
-            # Transformacja danych
-            X_trans, y_trans = preproc.transform(X.copy(), y.copy())
-
-            # Obsługa specyficznych parametrów (CatBoost/XGBoost)
-            cat_cols = X_trans.select_dtypes(include=['category', 'object']).columns.tolist()
-            if "CatBoost" in wrapper.model.__class__.__name__:
-                wrapper.model.set_params(cat_features=cat_cols)
-
-            wrapper.model.fit(X_trans, y_trans)
+            wrapper.model.fit(X_model, y)
 
         # 2. Meta-model: Trenujemy TYLKO jeśli refit_meta=True
         if self.refit_meta:
             print("  -> Generating OOF predictions for Meta-Learner (Slow)...")
             meta_features = []
-            for item in self.base_models:
-                wrapper = item['wrapper']
-                preproc = item['preprocessor']
-                X_trans, y_trans = preproc.transform(X.copy(), y.copy())
+            
+            for wrapper in self.base_models:
+                X_oof = X.copy()
+                model_name = wrapper.model.__class__.__name__
+                
+                # Powtórka logiki kategorii dla OOF
+                if "CatBoost" in model_name:
+                     wrapper.model.set_params(cat_features=cat_cols)
+                elif ("XGBClassifier" in model_name or "LGBMClassifier" in model_name) and cat_cols:
+                    for col in cat_cols:
+                        X_oof[col] = X_oof[col].astype("category")
 
                 try:
-                    oof_pred = cross_val_predict(wrapper.model, X_trans, y_trans, cv=5, method="predict_proba",
-                                                 n_jobs=-1)[:, 1]
+                    oof_pred = cross_val_predict(wrapper.model, X_oof, y, cv=5, method="predict_proba", n_jobs=-1)[:, 1]
                 except:
-                    oof_pred = cross_val_predict(wrapper.model, X_trans, y_trans, cv=5, method="predict", n_jobs=-1)
+                    oof_pred = cross_val_predict(wrapper.model, X_oof, y, cv=5, method="predict", n_jobs=-1)
+                
                 meta_features.append(oof_pred)
 
             X_meta = np.column_stack(meta_features)
             self.meta_model.fit(X_meta, y)
         else:
-            print("  -> Using pre-trained Meta-Learner (Skipping OOF generation).")
-
+            print("  -> Using pre-trained Meta-Learner params.")
+            # Jeśli meta model nie był trenowany, to musimy go tutaj nauczyć na czymś?
+            # W Twoim kodzie MiniAutoML meta_model jest już nauczony "na brudno" przed tworzeniem Ensemble.
+            # Więc tutaj zakładamy, że przekazany self.meta_model jest już .fit() z MiniAutoML.
+            pass
+            
         self.fitted_ = True
         return self
 
-    def predict_proba(self, X):
+    def predict_proba(self, X_raw):
+        """
+        Tutaj wchodzą SUROWE dane, więc musimy je przetworzyć raz globalnie.
+        """
         if not self.fitted_: raise ValueError("Ensemble not fitted")
-        meta_features = self._get_meta_features(X)
+        
+        # 1. Globalna transformacja
+        X_trans, _ = self.preprocessor.transform(X_raw.copy(), None)
+        # 2. Generowanie cech dla meta-modelu
+        meta_features = self._get_meta_features(X_trans)
+        
+        # 3. Predykcja meta-modelu
         return self.meta_model.predict_proba(meta_features)
 
     def predict(self, X):
         return (self.predict_proba(X)[:, 1] >= self.threshold).astype(int)
 
-    def _get_meta_features(self, X):
+    def _get_meta_features(self, X_processed):
+        """Generuje predykcje modeli bazowych na PRZETWORZONYCH danych."""
         preds = []
-        for item in self.base_models:
-            wrapper = item['wrapper']
-            preproc = item['preprocessor']
-            X_trans, _ = preproc.transform(X.copy(), None)
-            preds.append(wrapper.model.predict_proba(X_trans)[:, 1])
+        cat_cols = self.preprocessor.get_categorical_cols(X_processed)
+        
+        for wrapper in self.base_models:
+            X_model = X_processed.copy()
+            model_name = wrapper.model.__class__.__name__
+            
+            if ("XGBClassifier" in model_name or "LGBMClassifier" in model_name) and cat_cols:
+                for col in cat_cols:
+                    X_model[col] = X_model[col].astype("category")
+            
+            preds.append(wrapper.model.predict_proba(X_model)[:, 1])
+            
         return np.column_stack(preds)
 
 
@@ -89,7 +128,15 @@ class MiniAutoML:
         self.models_config = models_config
         self.metric = metric
         self.leaderboard = None
-        self.preprocessor = SimplePreprocessor()
+        self.preprocessor = AutoMLPreprocessor(
+                 add_kmeans_features=True,
+                 feature_selection= True,
+                 add_poly_features=True, 
+                 remove_outliers=True, 
+                 remove_multicollinearity=True, 
+                 multicollinearity_threshold=0.95, 
+                 id_threshold=0.95,
+                 random_state=42)
         self.best_model = None
 
     def fit(self, X_train, y_train, cv=5):
@@ -99,6 +146,21 @@ class MiniAutoML:
 
         scores = []
         n_samples, n_features = X_train.shape
+        
+        print("Begin preprocessing...")
+        X_train_proc, y_train= self.preprocessor.fit_transform(X_train, y_train)
+
+        # dla xgboost/lightgbm konwersja kolumn kategorycznych na 'category'
+        # Pobieramy kolumny kategoryczne RAZ
+        cat_cols = self.preprocessor.get_categorical_cols(X_train_proc)
+
+        # Przygotowujemy wersję "castowaną" dla XGBoost/LGBM do etapu screening
+        X_train_cat = X_train_proc.copy()
+        if cat_cols:
+            for col in cat_cols:
+                X_train_cat[col] = X_train_cat[col].astype("category")
+        print("Preprocessing done.")
+
 
         # ======================================================================
         # STAGE 1: SCREENING
@@ -117,21 +179,22 @@ class MiniAutoML:
                     or "CatBoost" in model_config["class"]
             )
 
-            preprocessor = SimplePreprocessor(handle_categorical=not use_native_cat)
-            X_prep, y_prep = preprocessor.fit_transform(X_train.copy(), y_train.copy())
             wrapper = ModelWrapper(model_config)
+            X_current = X_train_proc
 
-            cat_cols = X_prep.select_dtypes(include=["category", "object"]).columns.tolist()
-            if "CatBoost" in model_config["class"]:
-                wrapper.model.set_params(cat_features=cat_cols)
-            if "XGBClassifier" in model_config["class"] and use_native_cat:
-                wrapper.model.set_params(enable_categorical=True, tree_method="hist")
+            if "CatBoost" in model_config["class"] and cat_cols:
+                    wrapper.model.set_params(cat_features=cat_cols)
+            elif "XGBClassifier" in model_config["class"] or "LGBMClassifier" in model_config["class"]:
+                # Używamy wersji z typem 'category'
+                X_current = X_train_cat
+                if "XGBClassifier" in model_config["class"]:
+                    wrapper.model.set_params(enable_categorical=True, tree_method="hist")
 
             try:
                 cv_scores = cross_val_score(
                     wrapper.model,
-                    X_prep,
-                    y_prep,
+                    X_current,
+                    y_train,
                     cv=cv,
                     scoring="balanced_accuracy",
                     n_jobs=-1
@@ -146,15 +209,13 @@ class MiniAutoML:
                 "Model Class": model_config["class"],
                 "Metric Score": mean_score,
                 "Wrapper": wrapper,
-                "Used_Preprocessor": preprocessor,
                 "Config": model_config,
                 "Params": wrapper.model.get_params()  # Zapisujemy domyślne parametry
             })
 
             print(f"{model_config['name']} → BA = {mean_score:.4f}")
 
-        leaderboard = pd.DataFrame(scores)
-        leaderboard = leaderboard.sort_values(
+        leaderboard = pd.DataFrame(scores).sort_values(
             by="Metric Score", ascending=False
         ).reset_index(drop=True)
 
@@ -172,8 +233,7 @@ class MiniAutoML:
                 print(f" No search space for {config['name']}, skipping optimization.")
                 continue
 
-            preprocessor = row["Used_Preprocessor"]
-            X_prep, y_prep = preprocessor.transform(X_train.copy(), y_train.copy())
+
             wrapper = ModelWrapper(config)
 
             print(f"Optimizing {config['name']}...")
@@ -189,8 +249,19 @@ class MiniAutoML:
                     random_state=42,
                     verbose=0
                 )
-                search.fit(X_prep, y_prep)
 
+                X_current = X_train_proc
+
+                if "CatBoost" in model_config["class"] and cat_cols:
+                        wrapper.model.set_params(cat_features=cat_cols)
+                elif "XGBClassifier" in model_config["class"] or "LGBMClassifier" in model_config["class"]:
+                    # Używamy wersji z typem 'category'
+                    X_current = X_train_cat
+                    if "XGBClassifier" in model_config["class"]:
+                        wrapper.model.set_params(enable_categorical=True, tree_method="hist")
+
+                search.fit(X_current, y_train)
+                
                 if search.best_score_ > row["Metric Score"]:
                     # Ważne: Tworzymy nowy wrapper i ustawiamy mu najlepsze parametry
                     optimized_wrapper = ModelWrapper(config)
@@ -201,7 +272,6 @@ class MiniAutoML:
                         "Model Class": config["class"],
                         "Metric Score": search.best_score_,
                         "Wrapper": optimized_wrapper,
-                        "Used_Preprocessor": preprocessor,
                         "Config": config,
                         "Params": search.best_params_  # Zapisujemy najlepsze parametry
                     })
@@ -220,40 +290,31 @@ class MiniAutoML:
         selected = leaderboard.head(3).to_dict("records")
 
         meta_features = []
-        base_models_definitions = []
-
-        # Słownik do przechowywania parametrów modeli składowych dla logowania
+        base_wrappers = [] # Zbieramy same obiekty Wrapper, nie słowniki
         ensemble_base_params = {}
 
         for row in selected:
             wrapper = row["Wrapper"]
-            preprocessor = row["Used_Preprocessor"]
             model_name = row["Model Name"]
+            ensemble_base_params[model_name] = row["Params"]
 
-            # Zbieramy parametry modelu bazowego
-            # Pobieramy get_params(), jeśli Params jest słownikiem, używamy go, w przeciwnym razie pobieramy z modelu
-            current_params = row["Params"] if isinstance(row["Params"], dict) else wrapper.model.get_params()
-            ensemble_base_params[model_name] = current_params
-
-            X_prep, y_prep = preprocessor.transform(X_train.copy(), y_train.copy())
-
-            # OOF Predictions
+            # Decyzja o danych (zwykłe vs category cast)
+            X_current = X_train_proc
+            if ("XGBClassifier" in row["Config"]["class"] or "LGBMClassifier" in row["Config"]["class"]) and cat_cols:
+                X_current = X_train_cat
+            
+            # Generowanie OOF
             try:
-                oof_proba = cross_val_predict(wrapper.model, X_prep, y_prep, cv=cv, method="predict_proba", n_jobs=-1)[
-                            :, 1]
+                oof_proba = cross_val_predict(wrapper.model, X_current, y_train, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
             except:
-                oof_proba = cross_val_predict(wrapper.model, X_prep, y_prep, cv=cv, method="predict", n_jobs=-1)
-
+                oof_proba = cross_val_predict(wrapper.model, X_current, y_train, cv=cv, method="predict", n_jobs=-1)
+            
             meta_features.append(oof_proba)
 
-            # Definicja dla Ensemble
+            # Kopia wrappera dla Ensemble
             new_wrapper = ModelWrapper(row["Config"])
             new_wrapper.model.set_params(**wrapper.model.get_params())
-
-            base_models_definitions.append({
-                "wrapper": new_wrapper,
-                "preprocessor": preprocessor
-            })
+            base_wrappers.append(new_wrapper) # Dodajemy wrapper do listy
 
         X_meta = np.column_stack(meta_features)
 
@@ -285,10 +346,11 @@ class MiniAutoML:
                 best_thr = thr
 
         ensemble = StackingEnsemble(
-            base_models=base_models_definitions,
-            meta_model=meta_model,
+            base_models=base_wrappers, 
+            preprocessor=self.preprocessor, 
+            meta_model=meta_model, 
             threshold=best_thr,
-            refit_meta=False
+            refit_meta=False 
         )
 
         # Tworzymy strukture parametrów dla Ensemble
@@ -303,7 +365,6 @@ class MiniAutoML:
             "Model Class": "Ensemble",
             "Metric Score": best_thr_score,
             "Wrapper": ensemble,
-            "Used_Preprocessor": None,
             "Config": {},
             "Params": ensemble_full_params  # Zapisujemy skomplikowaną strukturę
         })
@@ -311,14 +372,12 @@ class MiniAutoML:
         # ======================================================================
         # FINAL
         # ======================================================================
-        leaderboard = pd.DataFrame(scores)
-        leaderboard = leaderboard.sort_values(
+        leaderboard = pd.DataFrame(scores).sort_values(
             by="Metric Score", ascending=False
         ).reset_index(drop=True)
 
         best = leaderboard.iloc[0]
         self.best_model = best["Wrapper"]
-        self.preprocessor = best["Used_Preprocessor"]
 
         print("\n==============================")
         print(f"WINNER: {best['Model Name']}")
@@ -354,23 +413,45 @@ class MiniAutoML:
 
         print("==============================")
 
-        if best["Model Class"] == "Ensemble":
-            self.best_model.fit(X_train, y_train)
+        print(f"Final fitting of {best['Model Name']}...")
+        
+        if isinstance(self.best_model, StackingEnsemble):
+            # Ensemble wie, że dostaje przetworzone dane
+            self.best_model.fit(X_train_proc, y_train) 
         else:
-            X_final, y_final = self.preprocessor.transform(X_train.copy(), y_train.copy())
-            self.best_model.fit(X_final, y_final)
+            # Pojedynczy model
+            model_class = best["Config"]["class"]
+            
+            if ("XGBClassifier" in model_class or "LGBMClassifier" in model_class) and cat_cols:
+                # Jeśli wygrał XGB/LGBM, musimy mu dać dane z kategoriami
+                self.best_model.fit(X_train_cat, y_train)
+            elif "CatBoost" in model_class and cat_cols:
+                 self.best_model.model.set_params(cat_features=cat_cols)
+                 self.best_model.fit(X_train_proc, y_train)
+            else:
+                self.best_model.fit(X_train_proc, y_train)
 
-        self.leaderboard = leaderboard
         return self.best_model
 
     def predict(self, X_test):
         if not self.best_model: raise ValueError("Call fit() first.")
 
         if isinstance(self.best_model, StackingEnsemble):
+            # Ensemble sam sobie robi transform wewnątrz predict
             return self.best_model.predict(X_test)
 
-        X_test, _ = self.preprocessor.transform(X_test, None)
-        return self.best_model.model.predict(X_test)
+        # Dla pojedynczego modelu musimy przetworzyć surowe dane
+        # Uwaga: używamy transform, nie fit_transform
+        X_test_proc, _ = self.preprocessor.transform(X_test, None)
+        
+        # Obsługa XGBoost przy predykcji pojedynczego modelu
+        cat_cols = self.preprocessor.get_categorical_cols(X_test_proc)
+        if ("XGBClassifier" in self.best_model.model.__class__.__name__ or 
+            "LGBMClassifier" in self.best_model.model.__class__.__name__) and cat_cols:
+             for col in cat_cols:
+                X_test_proc[col] = X_test_proc[col].astype("category")
+                
+        return self.best_model.model.predict(X_test_proc)
 
     def predict_proba(self, X_test):
         if not self.best_model: raise ValueError("Call fit() first.")
@@ -383,7 +464,9 @@ class MiniAutoML:
 
     def display_leaderboard(self, mode="short"):
         if self.leaderboard is None: raise ValueError("No leaderboard.")
-        cols = ["Model Name", "Metric Score"]
-        print(self.leaderboard[0]["Params"])
         print("================ Leaderboard ================")
-        return self.leaderboard[cols] if mode == "short" else self.leaderboard
+        if mode == "short":
+             cols = ["Model Name", "Metric Score"]
+             return self.leaderboard[cols]
+        else:
+             return self.leaderboard

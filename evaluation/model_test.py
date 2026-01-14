@@ -5,7 +5,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from model_main import MiniAutoML
+from MiniAutoML import MiniAutoML
 from sklearn.metrics import balanced_accuracy_score
 
 # Load model configurations from JSON
