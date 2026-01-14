@@ -8,7 +8,6 @@ from sklearn.model_selection import cross_val_score, ParameterSampler, cross_val
 from sklearn.linear_model import LogisticRegression
 # Zakładam, że te importy masz w swoim środowisku, jeśli nie - upewnij się, że pliki istnieją
 from wrappers.wrapper_model import ModelWrapper
-#from Preprocessing.SimplePreprocessor import SimplePreprocessor
 from Preprocessing.AutoMLPreprocessor import AutoMLPreprocessor
 
 class StackingEnsemble:
@@ -134,10 +133,12 @@ class MiniAutoML:
                  add_poly_features=True, 
                  remove_outliers=True, 
                  remove_multicollinearity=True, 
-                 multicollinearity_threshold=0.95, 
+                 multicollinearity_threshold=0.99, 
                  id_threshold=0.95,
                  random_state=42)
         self.best_model = None
+
+        warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
 
     def fit(self, X_train, y_train, cv=5):
         warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
@@ -184,11 +185,13 @@ class MiniAutoML:
 
             if "CatBoost" in model_config["class"] and cat_cols:
                     wrapper.model.set_params(cat_features=cat_cols)
-            elif "XGBClassifier" in model_config["class"] or "LGBMClassifier" in model_config["class"]:
+            elif "LGBMClassifier" in model_config["class"]:
                 # Używamy wersji z typem 'category'
                 X_current = X_train_cat
-                if "XGBClassifier" in model_config["class"]:
-                    wrapper.model.set_params(enable_categorical=True, tree_method="hist")
+            elif "XGBClassifier" in model_config["class"] and 'non_categorical' not in model_config["name"]:
+                # Używamy wersji z typem 'category'
+                X_current = X_train_cat
+                wrapper.model.set_params(enable_categorical=True, tree_method="hist")
 
             try:
                 cv_scores = cross_val_score(
@@ -251,14 +254,15 @@ class MiniAutoML:
                 )
 
                 X_current = X_train_proc
-
                 if "CatBoost" in model_config["class"] and cat_cols:
-                        wrapper.model.set_params(cat_features=cat_cols)
-                elif "XGBClassifier" in model_config["class"] or "LGBMClassifier" in model_config["class"]:
+                    wrapper.model.set_params(cat_features=cat_cols)
+                elif "LGBMClassifier" in model_config["class"]:
                     # Używamy wersji z typem 'category'
                     X_current = X_train_cat
-                    if "XGBClassifier" in model_config["class"]:
-                        wrapper.model.set_params(enable_categorical=True, tree_method="hist")
+                elif "XGBClassifier" in model_config["class"] and 'non_categorical' not in model_config["name"]:
+                    # Używamy wersji z typem 'category'
+                    X_current = X_train_cat
+                    wrapper.model.set_params(enable_categorical=True, tree_method="hist")
 
                 search.fit(X_current, y_train)
                 
@@ -302,7 +306,7 @@ class MiniAutoML:
             X_current = X_train_proc
             if ("XGBClassifier" in row["Config"]["class"] or "LGBMClassifier" in row["Config"]["class"]) and cat_cols:
                 X_current = X_train_cat
-            
+                
             # Generowanie OOF
             try:
                 oof_proba = cross_val_predict(wrapper.model, X_current, y_train, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]

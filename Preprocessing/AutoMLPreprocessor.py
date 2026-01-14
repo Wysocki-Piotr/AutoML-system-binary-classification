@@ -4,12 +4,14 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import LabelEncoder
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler, PowerTransformer, OrdinalEncoder
 from sklearn.impute import SimpleImputer
-from sklearn.feature_selection import SelectFromModel, SequentialFeatureSelector
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import ExtraTreesClassifier, IsolationForest
 from sklearn.model_selection import train_test_split
 from sklearn.cluster import MiniBatchKMeans
+
 from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectFromModel
+from mlxtend.feature_selection import SequentialFeatureSelector as SFS
 
 
 import warnings
@@ -538,7 +540,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         n_start = len(initial_cols)
         
         # Próg przełączenia między SFS a PCA
-        SFS_CAP_THRESHOLD = 75
+        SFS_CAP_THRESHOLD = 50
 
         # ==========================================
         # ETAP 1: ENSEMBLE SCREENING (L1 + ExtraTrees)
@@ -556,8 +558,9 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
             # B. Ocena Nieliniowa (ExtraTrees)
             # Drzewa widzą interakcje.
-            et_model = ExtraTreesClassifier(n_estimators=50, random_state=self.random_state, n_jobs=-1, class_weight='balanced')
-            et_selector = SelectFromModel(estimator=et_model, threshold="0.1*mean")
+            ETC_threshold = "0.25*mean"  # próg
+            et_model = ExtraTreesClassifier(n_estimators=75, min_samples_leaf=7, random_state=self.random_state, n_jobs=-1, class_weight='balanced')
+            et_selector = SelectFromModel(estimator=et_model, threshold=ETC_threshold)
             et_selector.fit(X_curr, y)
             mask_et = et_selector.get_support()
             
@@ -600,9 +603,12 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
             est = LogisticRegression(class_weight='balanced', solver='liblinear', random_state=self.random_state)
             
-            self.selector_model = SequentialFeatureSelector(
+            self.selector_model = SFS(
                 est,
-                direction='backward',
+                k_features='best', # parsimonious
+                forward=False, 
+                floating=False, 
+                verbose=2,  # <--- TU JEST OPCJA VERBOSE (2 = szczegółowa)
                 scoring='roc_auc',
                 cv=3,
                 n_jobs=-1
@@ -610,8 +616,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
             try:
                 self.selector_model.fit(X_curr, y)
-                support_sfs = self.selector_model.get_support()
-                self.final_selected_cols = np.array(filtered_cols)[support_sfs].tolist()
+                self.final_selected_cols = self.final_selected_cols = list(self.selector_model.k_feature_names_)
                 print(f"-> SFS zakończony. Wybrano {len(self.final_selected_cols)} najlepszych cech.")
             except Exception as e:
                 print(f"   Błąd SFS ({e}). Zostawiam wynik po screeningu.")
@@ -626,7 +631,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
             # AUTOMATYCZNY DOBÓR:
             # To eliminuje współliniowość i szum, ale zostawia prawie cały sygnał.
-            target_variance = 0.95
+            target_variance = 0.99
             
             # Bezpiecznik: PCA nie może stworzyć więcej komponentów niż mamy próbek
             # (choć sklearn z floatem i tak by to obsłużył, svd_solver='full' jest precyzyjny)
