@@ -4,7 +4,7 @@ import time
 import warnings
 from copy import deepcopy
 from sklearn.metrics import balanced_accuracy_score, brier_score_loss, accuracy_score
-from sklearn.model_selection import cross_val_score, ParameterSampler, cross_val_predict, StratifiedKFold
+from sklearn.model_selection import cross_val_score, ParameterSampler, cross_val_predict, KFold, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 # Zakładam, że te importy masz w swoim środowisku, jeśli nie - upewnij się, że pliki istnieją
 from wrappers.wrapper_model import ModelWrapper
@@ -143,7 +143,7 @@ class MiniAutoML:
         warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
         from sklearn.experimental import enable_halving_search_cv  # noqa
         from sklearn.model_selection import HalvingRandomSearchCV
-
+        cv_stratedy = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
         scores = []
         n_samples, n_features = X_train.shape
         
@@ -195,7 +195,7 @@ class MiniAutoML:
                     wrapper.model,
                     X_current,
                     y_train,
-                    cv=cv,
+                    cv=cv_stratedy,
                     scoring="balanced_accuracy",
                     n_jobs=-1
                 )
