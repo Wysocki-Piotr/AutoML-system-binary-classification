@@ -518,151 +518,151 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             print(f"--- Wstępne czyszczenie: Usunięto {len(self.cols_to_drop_early)} kolumn (stałe lub ID) ---")
             # print(f"-> Usunięte: {self.cols_to_drop_early}")
 
-        def _fit_feature_selection(self, X, y):
-            """
-            Inteligentna selekcja cech:
-            1. ENSEMBLE SCREENING (L1 + ExtraTrees):
-            - Usuwa zmienne, które są słabe ZARÓWNO liniowo, jak i nieliniowo.
-            - To jest 'miękkie' wstępne czyszczenie.
-            2. HYBRYDOWA REDUKCJA:
-            - Jeśli cech zostało mało (<60) -> SFS Backward (Maksymalna precyzja).
-            - Jeśli cech zostało dużo (>60) -> PCA (Kompresja informacji).
-            """
-            if not self.feature_selection:
-                self.selection_mode = None
-                return
+    def _fit_feature_selection(self, X, y):
+        """
+        Inteligentna selekcja cech:
+        1. ENSEMBLE SCREENING (L1 + ExtraTrees):
+        - Usuwa zmienne, które są słabe ZARÓWNO liniowo, jak i nieliniowo.
+        - To jest 'miękkie' wstępne czyszczenie.
+        2. HYBRYDOWA REDUKCJA:
+        - Jeśli cech zostało mało (<60) -> SFS Backward (Maksymalna precyzja).
+        - Jeśli cech zostało dużo (>60) -> PCA (Kompresja informacji).
+        """
+        if not self.feature_selection:
+            self.selection_mode = None
+            return
 
-            print(f"\n--- Inteligentna Selekcja Cech (Hybrid) ---")
-            X_curr = X.copy()
-            initial_cols = X_curr.columns.tolist()
-            n_start = len(initial_cols)
+        print(f"\n--- Inteligentna Selekcja Cech (Hybrid) ---")
+        X_curr = X.copy()
+        initial_cols = X_curr.columns.tolist()
+        n_start = len(initial_cols)
+        
+        # Próg przełączenia między SFS a PCA
+        SFS_CAP_THRESHOLD = 75
+
+        # ==========================================
+        # ETAP 1: ENSEMBLE SCREENING (L1 + ExtraTrees)
+        # ==========================================
+        print(f"-> Etap 1: Wstępne usuwanie szumu (L1 + ExtraTrees)...")
+        
+        try:
+            # A. Ocena Liniowa (L1 / Lasso)
+            # C=0.5 to umiarkowana regularyzacja. threshold='0.1*mean' jest bardzo łagodny.
+            # Chcemy wyrzucić tylko totalne zera.
+            l1_model = LogisticRegression(penalty='l1', C=0.5, solver='liblinear', random_state=self.random_state, class_weight='balanced')
+            l1_selector = SelectFromModel(estimator=l1_model, threshold="0.1*mean")
+            l1_selector.fit(X_curr, y)
+            mask_l1 = l1_selector.get_support()
             
-            # Próg przełączenia między SFS a PCA
-            SFS_CAP_THRESHOLD = 75
+            # B. Ocena Nieliniowa (ExtraTrees)
+            # Drzewa widzą interakcje.
+            et_model = ExtraTreesClassifier(n_estimators=50, random_state=self.random_state, n_jobs=-1, class_weight='balanced')
+            et_selector = SelectFromModel(estimator=et_model, threshold="0.1*mean")
+            et_selector.fit(X_curr, y)
+            mask_et = et_selector.get_support()
+            
+            # C. Suma Zbiorów (Union)
+            # Zostawiamy cechę, jeśli L1 LUB Drzewa uważają ją za ważną.
+            final_mask = mask_l1 | mask_et # Bitwise OR
+            
+            # Aktualizacja danych
+            filtered_cols = np.array(initial_cols)[final_mask].tolist()
+            
+            # Zabezpieczenie: jeśli algorytm chce usunąć wszystko (mało prawdopodobne), bierzemy wynik ExtraTrees
+            if len(filtered_cols) < 2:
+                print("   Uwaga: Ensemble chciał usunąć prawie wszystko. Cofam do wyniku samych drzew.")
+                filtered_cols = np.array(initial_cols)[mask_et].tolist()
 
-            # ==========================================
-            # ETAP 1: ENSEMBLE SCREENING (L1 + ExtraTrees)
-            # ==========================================
-            print(f"-> Etap 1: Wstępne usuwanie szumu (L1 + ExtraTrees)...")
+            X_curr = X_curr[filtered_cols]
+            n_after_screen = len(filtered_cols)
+            
+            n_dropped = n_start - n_after_screen
+            print(f"   L1 wybrało: {sum(mask_l1)}, Trees wybrało: {sum(mask_et)}")
+            print(f"   Wspólna decyzja: Zachowano {n_after_screen} z {n_start} cech (usunięto {n_dropped} najsłabszych).")
+
+        except Exception as e:
+            print(f"   Błąd w Screeningu ({e}). Pomijam ten etap.")
+            filtered_cols = initial_cols
+            n_after_screen = n_start
+
+        # Zapamiętujemy stan po screeningu na wypadek błędu w etapie 2
+        self.final_selected_cols = filtered_cols
+
+        # ==========================================
+        # ETAP 2: DECYZJA (PCA vs SFS)
+        # ==========================================
+        # LOGIKA HYBRYDOWA
+        if n_after_screen <= SFS_CAP_THRESHOLD:
+            # --- ŚCIEŻKA A: Mało cech -> SFS (Precyzja) ---
+            print(f"-> Etap 2: Liczba cech ({n_after_screen}) <= {SFS_CAP_THRESHOLD}. Uruchamiam SFS Backward.")
+            
+            self.selection_mode = 'sfs'
+            
+            est = LogisticRegression(class_weight='balanced', solver='liblinear', random_state=self.random_state)
+            
+            self.selector_model = SequentialFeatureSelector(
+                est,
+                direction='backward',
+                scoring='roc_auc',
+                cv=3,
+                n_jobs=-1
+            )
             
             try:
-                # A. Ocena Liniowa (L1 / Lasso)
-                # C=0.5 to umiarkowana regularyzacja. threshold='0.1*mean' jest bardzo łagodny.
-                # Chcemy wyrzucić tylko totalne zera.
-                l1_model = LogisticRegression(penalty='l1', C=0.5, solver='liblinear', random_state=self.random_state, class_weight='balanced')
-                l1_selector = SelectFromModel(estimator=l1_model, threshold="0.1*mean")
-                l1_selector.fit(X_curr, y)
-                mask_l1 = l1_selector.get_support()
-                
-                # B. Ocena Nieliniowa (ExtraTrees)
-                # Drzewa widzą interakcje.
-                et_model = ExtraTreesClassifier(n_estimators=50, random_state=self.random_state, n_jobs=-1, class_weight='balanced')
-                et_selector = SelectFromModel(estimator=et_model, threshold="0.1*mean")
-                et_selector.fit(X_curr, y)
-                mask_et = et_selector.get_support()
-                
-                # C. Suma Zbiorów (Union)
-                # Zostawiamy cechę, jeśli L1 LUB Drzewa uważają ją za ważną.
-                final_mask = mask_l1 | mask_et # Bitwise OR
-                
-                # Aktualizacja danych
-                filtered_cols = np.array(initial_cols)[final_mask].tolist()
-                
-                # Zabezpieczenie: jeśli algorytm chce usunąć wszystko (mało prawdopodobne), bierzemy wynik ExtraTrees
-                if len(filtered_cols) < 2:
-                    print("   Uwaga: Ensemble chciał usunąć prawie wszystko. Cofam do wyniku samych drzew.")
-                    filtered_cols = np.array(initial_cols)[mask_et].tolist()
-
-                X_curr = X_curr[filtered_cols]
-                n_after_screen = len(filtered_cols)
-                
-                n_dropped = n_start - n_after_screen
-                print(f"   L1 wybrało: {sum(mask_l1)}, Trees wybrało: {sum(mask_et)}")
-                print(f"   Wspólna decyzja: Zachowano {n_after_screen} z {n_start} cech (usunięto {n_dropped} najsłabszych).")
-
+                self.selector_model.fit(X_curr, y)
+                support_sfs = self.selector_model.get_support()
+                self.final_selected_cols = np.array(filtered_cols)[support_sfs].tolist()
+                print(f"-> SFS zakończony. Wybrano {len(self.final_selected_cols)} najlepszych cech.")
             except Exception as e:
-                print(f"   Błąd w Screeningu ({e}). Pomijam ten etap.")
-                filtered_cols = initial_cols
-                n_after_screen = n_start
+                print(f"   Błąd SFS ({e}). Zostawiam wynik po screeningu.")
+                self.selection_mode = 'filter_only'
+                # final_selected_cols już jest ustawione na filtered_cols
 
-            # Zapamiętujemy stan po screeningu na wypadek błędu w etapie 2
-            self.final_selected_cols = filtered_cols
-
-            # ==========================================
-            # ETAP 2: DECYZJA (PCA vs SFS)
-            # ==========================================
-            # LOGIKA HYBRYDOWA
-            if n_after_screen <= SFS_CAP_THRESHOLD:
-                # --- ŚCIEŻKA A: Mało cech -> SFS (Precyzja) ---
-                print(f"-> Etap 2: Liczba cech ({n_after_screen}) <= {SFS_CAP_THRESHOLD}. Uruchamiam SFS Backward.")
-                
-                self.selection_mode = 'sfs'
-                
-                est = LogisticRegression(class_weight='balanced', solver='liblinear', random_state=self.random_state)
-                
-                self.selector_model = SequentialFeatureSelector(
-                    est,
-                    direction='backward',
-                    scoring='roc_auc',
-                    cv=3,
-                    n_jobs=-1
-                )
-                
-                try:
-                    self.selector_model.fit(X_curr, y)
-                    support_sfs = self.selector_model.get_support()
-                    self.final_selected_cols = np.array(filtered_cols)[support_sfs].tolist()
-                    print(f"-> SFS zakończony. Wybrano {len(self.final_selected_cols)} najlepszych cech.")
-                except Exception as e:
-                    print(f"   Błąd SFS ({e}). Zostawiam wynik po screeningu.")
-                    self.selection_mode = 'filter_only'
-                    # final_selected_cols już jest ustawione na filtered_cols
-
-            else:
-                # --- ŚCIEŻKA B: Dużo cech -> PCA (Kompresja) ---
-                print(f"-> Etap 2: Liczba cech ({n_after_screen}) > {SFS_CAP_THRESHOLD}. Uruchamiam PCA dla wydajności.")
-                
-                self.selection_mode = 'pca'
-                
-                # AUTOMATYCZNY DOBÓR:
-                # To eliminuje współliniowość i szum, ale zostawia prawie cały sygnał.
-                target_variance = 0.99
-                
-                # Bezpiecznik: PCA nie może stworzyć więcej komponentów niż mamy próbek
-                # (choć sklearn z floatem i tak by to obsłużył, svd_solver='full' jest precyzyjny)
-                self.pca_model = PCA(n_components=target_variance, random_state=self.random_state, svd_solver='full')
-                
-                # Uczymy PCA na kolumnach, które przeszły screening
-                self.final_selected_cols = filtered_cols 
-                
-                # Fitujemy
-                self.pca_model.fit(X_curr)
-                
-                n_comps = self.pca_model.n_components_
-                var_explained = np.sum(self.pca_model.explained_variance_ratio_)
-                
-                print(f"-> PCA zakończone. Skompresowano {n_after_screen} cech do {n_comps} komponentów.")
-                print(f"   Wyjaśniona wariancja: {var_explained:.4f} (Cel: {target_variance})")
+        else:
+            # --- ŚCIEŻKA B: Dużo cech -> PCA (Kompresja) ---
+            print(f"-> Etap 2: Liczba cech ({n_after_screen}) > {SFS_CAP_THRESHOLD}. Uruchamiam PCA dla wydajności.")
             
-            # ==========================================
-            # ETAP 3: AKTUALIZACJA LISTY KOLUMN (KLUCZOWE!)
-            # ==========================================
-            if self.selection_mode == 'pca':
-                # PCA tworzy zupełnie nowe kolumny numeryczne (PC1, PC2...)
-                # Tracimy oryginalne kategorie i liczby.
-                n_comps = self.pca_model.n_components_
-                new_pca_cols = [f"PC{i+1}" for i in range(n_comps)]
-                
-                self.num_cols = new_pca_cols
-                self.cat_cols = [] # Po PCA nie ma już kategorii
-                
-            else:
-                # SFS lub Filter - tylko filtrujemy istniejące listy
-                # Musimy zostawić tylko te, które są w final_selected_cols
-                final_set = set(self.final_selected_cols)
-                
-                self.num_cols = [c for c in self.num_cols if c in final_set]
-                self.cat_cols = [c for c in self.cat_cols if c in final_set]
+            self.selection_mode = 'pca'
+            
+            # AUTOMATYCZNY DOBÓR:
+            # To eliminuje współliniowość i szum, ale zostawia prawie cały sygnał.
+            target_variance = 0.99
+            
+            # Bezpiecznik: PCA nie może stworzyć więcej komponentów niż mamy próbek
+            # (choć sklearn z floatem i tak by to obsłużył, svd_solver='full' jest precyzyjny)
+            self.pca_model = PCA(n_components=target_variance, random_state=self.random_state, svd_solver='full')
+            
+            # Uczymy PCA na kolumnach, które przeszły screening
+            self.final_selected_cols = filtered_cols 
+            
+            # Fitujemy
+            self.pca_model.fit(X_curr)
+            
+            n_comps = self.pca_model.n_components_
+            var_explained = np.sum(self.pca_model.explained_variance_ratio_)
+            
+            print(f"-> PCA zakończone. Skompresowano {n_after_screen} cech do {n_comps} komponentów.")
+            print(f"   Wyjaśniona wariancja: {var_explained:.4f} (Cel: {target_variance})")
+        
+        # ==========================================
+        # ETAP 3: AKTUALIZACJA LISTY KOLUMN (KLUCZOWE!)
+        # ==========================================
+        if self.selection_mode == 'pca':
+            # PCA tworzy zupełnie nowe kolumny numeryczne (PC1, PC2...)
+            # Tracimy oryginalne kategorie i liczby.
+            n_comps = self.pca_model.n_components_
+            new_pca_cols = [f"PC{i+1}" for i in range(n_comps)]
+            
+            self.num_cols = new_pca_cols
+            self.cat_cols = [] # Po PCA nie ma już kategorii
+            
+        else:
+            # SFS lub Filter - tylko filtrujemy istniejące listy
+            # Musimy zostawić tylko te, które są w final_selected_cols
+            final_set = set(self.final_selected_cols)
+            
+            self.num_cols = [c for c in self.num_cols if c in final_set]
+            self.cat_cols = [c for c in self.cat_cols if c in final_set]
     
     def _transform_feature_selection(self, X):
         """Aplikuje selekcję/transformację zgodnie z ustalonym trybem."""

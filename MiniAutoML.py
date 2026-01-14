@@ -130,8 +130,7 @@ class MiniAutoML:
         self.leaderboard = None
         self.preprocessor = AutoMLPreprocessor(
                  add_kmeans_features=True,
-                 feature_selection_method='sfs', # opcje to None, 'pca' lub 'sfs'
-                 #n_features=0.25,                # procent cech do zachowania przy pca
+                 feature_selection= True,
                  add_poly_features=True, 
                  remove_outliers=True, 
                  remove_multicollinearity=True, 
