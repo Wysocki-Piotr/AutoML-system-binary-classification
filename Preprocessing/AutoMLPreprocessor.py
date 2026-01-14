@@ -626,7 +626,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
             # AUTOMATYCZNY DOBÓR:
             # To eliminuje współliniowość i szum, ale zostawia prawie cały sygnał.
-            target_variance = 0.99
+            target_variance = 0.95
             
             # Bezpiecznik: PCA nie może stworzyć więcej komponentów niż mamy próbek
             # (choć sklearn z floatem i tak by to obsłużył, svd_solver='full' jest precyzyjny)
@@ -694,7 +694,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         Zwraca listę kolumn kategorycznych, które znajdują się w przetworzonym zbiorze danych.
         Przydatne dla CatBoost/XGBoost po selekcji cech (SFS).
         """
-        if self.feature_selection_method == 'pca':
+        if self.selection_mode == 'pca':
             # PCA zamienia wszystko na liczby (PC1, PC2...), więc nie ma już kategorii.
             return []
         
