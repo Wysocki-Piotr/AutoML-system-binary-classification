@@ -4,9 +4,9 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import LabelEncoder
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler, PowerTransformer, OrdinalEncoder
 from sklearn.impute import SimpleImputer
-from sklearn.feature_selection import SequentialFeatureSelector
+from sklearn.feature_selection import SelectFromModel, SequentialFeatureSelector
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import ExtraTreesClassifier, IsolationForest
 from sklearn.model_selection import train_test_split
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
@@ -16,9 +16,9 @@ import warnings
 
 class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
     def __init__(self, target_col=None, add_kmeans_features=True,
-                 feature_selection_method='pca', # opcje to None, 'pca' lub 'sfs'
-                 n_features=0.25,                # <--- NOWOŚĆ: domyślnie 25% (0.25)
+                 feature_selection=True, # opcje to True, False
                  add_poly_features=False, remove_outliers=True, 
+                 id_threshold=0.95,
                  remove_multicollinearity=True, multicollinearity_threshold=0.95,
                  random_state=None):
         
@@ -51,15 +51,9 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             Dodaje kolumny z dystansem do centroidów oraz ID klastra.
             Pomaga modelom wykrywać nieliniowe grupy w danych.
 
-        feature_selection_method : {None, 'pca', 'sfs'} (domyślnie='pca')
+        feature_selection : {True, False} (domyślnie=True)
+            Redukcja liczby cech
             
-            Metoda redukcji liczby cech:
-            - None: brak selekcji cech.
-            - 'pca': Szybka redukcja wymiarowości. Tworzy nowe, syntetyczne cechy (PC1, PC2...),
-              które maksymalizują wariancję. Zalecane przy dużej liczbie kolumn.
-            - 'sfs': Sequential Feature Selection (Backward). Wolniejsza, ale wybiera
-              najlepsze *oryginalne* kolumny. Zachowuje interpretowalność biznesową.
-
         n_features : float lub int (domyślnie=0.25)
             Ile cech zachować po selekcji:
             - float (0.0 - 1.0): Procent początkowych kolumn (np. 0.25 to 25%).
@@ -86,35 +80,47 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         self.remove_outliers = remove_outliers
         
         # Column types
-        self.num_cols = []
-        self.cat_cols = []
-        self.date_cols = []
+        self.original_num_cols = [] # Oryginalne kolumny numeryczne na samym początku
+        self.num_cols = [] # Lista kolumn numerycznych
+        self.cat_cols = [] # Lista kolumn kategorycznych
+        self.date_cols = [] # Lista kolumn datowych
         
+        # Usuwanie IDków
+        self.id_threshold = id_threshold
+        self.cols_to_drop_early = []
+
         # Imputers and transformers
         self.imputer_num = SimpleImputer(strategy='median')
+        self.cols_to_impute_num = [] # Lista kolumn do imputacji numerycznej
         self.imputer_cat = SimpleImputer(strategy='most_frequent')
+        self.cols_to_impute_cat = [] # Lista kolumn do imputacji kategorycznej
         self.power_transformer = PowerTransformer(method='yeo-johnson', standardize=True)
         self.cat_encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
 
         # --- Nowe pola dla KMeans ---
         self.add_kmeans_features = add_kmeans_features
         self.kmeans_model = None
-        self.kmeans_scaler = StandardScaler() # Osobny skaler tylko dla KMeans (zgodnie z ideą mljar)
-        self.kmeans_cols = [] # Lista nazw nowych kolumn
+        self.kmeans_num_cols = [] # Lista nazw num w kmeans
+        self.kmeans_cat_cols = [] # Lista nazw cat w kmeans
 
         # --- Nowe pola dla interakcji ---
         self.add_poly_features = add_poly_features
         self.poly_transformer = None
+        self.cols_to_poly = [] # Lista kolumn do interakcji
+        self.cols_to_poly_new_names = [] # Nazwy nowych cech z interakcji
 
         # Target processing
         self.imputer_y = SimpleImputer(strategy='most_frequent')
         self.encoder_y = LabelEncoder()
 
         # Feature Selection
-        # Parametry selekcji
-        self.feature_selection_method = feature_selection_method # <--- Przypisanie
-        self.n_features = n_features                             # <--- Przypisanie
-        self.selector = None
+        # Feature Selection Config
+        self.feature_selection = feature_selection
+        # Stan selekcji
+        self.selection_mode = None          # 'pca', 'sfs', 'filter_only' lub None
+        self.final_selected_cols = []       # Dla SFS/Filtra
+        self.pca_model = None               # Dla PCA
+        self.selector_model = None          # Dla SFS
 
         # --- Współliniowość ---
         self.remove_multicollinearity = remove_multicollinearity
@@ -157,43 +163,89 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
 
     def _detect_columns(self, X):
-        """Automatyczne wykrywanie typów kolumn (zabezpieczone i wyciszone)."""
+        """
+        Automatyczne wykrywanie typów kolumn z zaawansowaną heurystyką.
+        Kolejność:
+        1. Daty (po próbce danych).
+        2. Niska liczność (<10 unikalnych) -> KATEGORIA (nawet jeśli to liczby/bool).
+        3. Typy numeryczne -> NUMERYCZNE.
+        4. Object, który da się rzutować na liczbę (np. "3.14") -> NUMERYCZNE.
+        5. Reszta -> KATEGORIA.
+        """
         self.date_cols = []
+        self.cat_cols = []
+        self.num_cols = []
+        self.original_num_cols = []
+
         temp_X = X.copy()
         
-        # Iterujemy po potencjalnych kolumnach (object i datetime)
-        for col in temp_X.select_dtypes(include=['object', 'datetime']).columns:
+        # 1. Wykrywanie DAT (Twoja logika z optymalizacją)
+        # Iterujemy tylko po object i datetime, żeby nie sprawdzać floatów
+        potential_dates = temp_X.select_dtypes(include=['object', 'datetime']).columns
+        
+        for col in potential_dates:
             try:
-                # 1. Sprawdzamy czy to nie są liczby zapisane jako tekst
-                if temp_X[col].dtype == 'object' and temp_X[col].astype(str).str.isnumeric().all():
-                    continue
-                
-                # 2. Próba konwersji na datę
-                # Używamy catch_warnings, aby ignorować komunikat "Could not infer format..."
-                # Ponieważ właśnie tego chcemy - sprawdzić czy Pandas poradzi sobie ze "zgadywaniem".
+                # Jeśli to tekst wyglądający na liczbę, pomijamy sprawdzanie daty
+                # (chyba że to timestamp, ale to rzadkość w csv bez formatowania)
+                if temp_X[col].dtype == 'object':
+                    # Szybki test czy to nie same cyfry (unika mielenia IDków przez to_datetime)
+                    # Używamy próbki dla szybkości
+                    sample_str = temp_X[col].dropna().astype(str).iloc[:100]
+                    if sample_str.str.replace('.', '', 1).str.isnumeric().all(): 
+                        continue
+
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    
-                    # Optymalizacja: Sprawdzamy tylko próbkę (np. 100 wierszy) zamiast całej kolumny.
-                    # Jeśli próbka jest datą, to cała kolumna prawdopodobnie też.
-                    # To znacznie przyspiesza działanie na dużych danych.
                     sample = temp_X[col].dropna().iloc[:100]
                     if len(sample) > 0:
                         pd.to_datetime(sample, errors='raise')
-                    else:
-                        # Jeśli pusta kolumna, pomijamy
-                        continue
-                
-                # Jeśli przeszło bez błędu, uznajemy to za datę
-                self.date_cols.append(col)
-                
+                        self.date_cols.append(col)
             except (ValueError, TypeError):
-                # Jeśli pd.to_datetime rzuci błąd, to nie jest data
                 continue
         
-        remaining = X.drop(columns=self.date_cols)
-        self.cat_cols = remaining.select_dtypes(include=['object', 'category']).columns.tolist()
-        self.num_cols = remaining.select_dtypes(include=['number']).columns.tolist()
+        # Ustalamy co zostało do sprawdzenia
+        remaining_cols = [c for c in temp_X.columns if c not in self.date_cols]
+        
+        for col in remaining_cols:
+            series = temp_X[col]
+            
+            # 2. Reguła MAŁEJ LICZNOŚCI (Low Cardinality)
+            # Jeśli wartości jest mniej niż 10, traktujemy jako kategorię.
+            # Dotyczy to intów, floatów, booli i stringów.
+            # dropna=True -> nie liczymy NaN jako unikalnej wartości
+            if series.nunique(dropna=True) < 10:
+                self.cat_cols.append(col)
+                continue
+            
+            # 3. Typy wbudowane NUMERYCZNE (int, float)
+            # Skoro ma >= 10 unikalnych i jest liczbą, to zostaje liczbą.
+            if pd.api.types.is_numeric_dtype(series):
+                self.num_cols.append(col)
+                continue
+            
+            # 4. Wykrywanie LICZB UKRYTYCH W TEKŚCIE (np. "12.5", "-100")
+            # is_numeric() nie łapie floatów i minusów, to_numeric jest lepsze.
+            try:
+                # errors='coerce' zamieni tekst na NaN. 
+                # Sprawdzamy czy nie przybyło nam NaN-ów w porównaniu do oryginału.
+                converted = pd.to_numeric(series, errors='coerce')
+                
+                initial_nans = series.isna().sum()
+                new_nans = converted.isna().sum()
+                
+                if initial_nans == new_nans:
+                    # Udało się skonwertować wszystko bez błędów -> to jest liczba
+                    self.num_cols.append(col)
+                    # (Opcjonalnie można by tu od razu nadpisać X[col], ale detect ma tylko wykrywać)
+                else:
+                    # Przybyło błędów konwersji -> to jest tekst
+                    self.cat_cols.append(col)
+            except Exception:
+                # W razie jakiegokolwiek innego błędu -> kategoria
+                self.cat_cols.append(col)
+        self.original_num_cols = self.num_cols.copy()
+        # Logowanie dla pewności
+        # print(f"DEBUG: Daty: {len(self.date_cols)}, Kat: {len(self.cat_cols)}, Num: {len(self.num_cols)}")
 
     def _process_dates_cyclical(self, df):
         df_out = df.copy()
@@ -213,6 +265,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
                 df_out[f'{col}_year'] = dates.dt.year
                 df_out[f'{col}_is_weekend'] = (dates.dt.dayofweek >= 5).astype(int)
                 df_out.drop(columns=[col], inplace=True)
+        
         return df_out
 
     def _process_target(self, y, fit=False):
@@ -264,27 +317,12 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
     def _fit_kmeans(self, X):
         """Logika uczenia KMeans inspirowana biblioteką MLJAR."""
-        # KMeans działa tylko na liczbach. Bierzemy te, które już mamy wykryte.
-        # Ważne: używamy num_cols, które są już w X (czyli po imputacji).
-        valid_cols = [c for c in self.num_cols if c in X.columns]
-        
-        if not valid_cols or X.shape[0] < 10: # Zabezpieczenie dla małych danych
-            print("Pominięto KMeans (brak kolumn numerycznych lub za mało danych).")
-            self.add_kmeans_features = False
-            return
-
-        # 1. Skalowanie danych (zgodnie z MLJAR używamy StandardScalera przed KMeans)
-        X_subset = X[valid_cols].values
-        self.kmeans_scaler.fit(X_subset)
-        X_scaled = self.kmeans_scaler.transform(X_subset)
-        
-        # 2. Wybór liczby klastrów (heurystyka MLJAR)
+        # Wybór liczby klastrów (heurystyka MLJAR)
         n_clusters = int(np.log10(X.shape[0]) * 8)
         n_clusters = max(2, n_clusters)      # Minimum 2 klastry
         n_clusters = min(n_clusters, 15)     # Ograniczamy max (żeby nie zrobiło 100 kolumn)
         # MLJAR robi min(n, X.shape[1]), ale tutaj bezpieczniej dać sztywny limit górny dla wydajności
         
-        # 3. Fitowanie modelu
         self.kmeans_model = MiniBatchKMeans(
             n_clusters=n_clusters, 
             init="k-means++", 
@@ -292,10 +330,14 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             random_state=self.random_state,
             n_init='auto'
         )
-        self.kmeans_model.fit(X_scaled)
+        self.kmeans_model.fit(X)
         
-        # 4. Zapamiętanie nazw nowych cech
-        self.kmeans_cols = [f"Dist_Cluster_{i}" for i in range(n_clusters)] + ["Cluster"]
+        # Zapamiętanie nazw nowych cech
+        self.kmeans_num_cols = [f"Dist_Cluster_{i}" for i in range(n_clusters)]
+        self.kmeans_cat_cols = ["Cluster"]
+        
+        self.num_cols.extend(self.kmeans_num_cols)
+        self.cat_cols.extend(self.kmeans_cat_cols)
         print(f"--- KMeans: Wytrenowano {n_clusters} klastrów ---")
 
     def _transform_with_kmeans(self, X):
@@ -304,24 +346,17 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             return X
         
         X_out = X.copy()
-        valid_cols = [c for c in self.num_cols if c in X_out.columns]
         
-        if not valid_cols:
-            return X_out
-
-        # Skalowanie i predykcja
-        X_scaled = self.kmeans_scaler.transform(X_out[valid_cols].values)
-        
-        distances = self.kmeans_model.transform(X_scaled)
-        clusters = self.kmeans_model.predict(X_scaled)
+        distances = self.kmeans_model.transform(X_out)
+        clusters = self.kmeans_model.predict(X_out)
         
         # Dodawanie kolumn do DataFrame
         # 1. Dystanse do centroidów
-        dist_cols = self.kmeans_cols[:-1] # Wszystkie oprócz ostatniego ('Cluster')
+        dist_cols = self.kmeans_num_cols
         X_out[dist_cols] = distances
         
         # 2. ID Klastra (jako kategoria/int)
-        X_out["Cluster"] = clusters
+        X_out[self.kmeans_cat_cols[0]] = clusters
         
         return X_out
 
@@ -337,14 +372,14 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         # Ograniczmy się np. do 10-15 najważniejszych lub po prostu wszystkich jeśli jest ich mało.
         if len(valid_cols) > 20:
             # Wersja prosta: bierzemy pierwsze 20 (można tu dodać logikę wyboru np. wariancji)
-            cols_to_poly = valid_cols[:20]
+            self.cols_to_poly = valid_cols[:20]
         else:
-            cols_to_poly = valid_cols
+            self.cols_to_poly = valid_cols
 
-        if not cols_to_poly:
+        if not self.cols_to_poly:
             return X
 
-        X_poly_in = X[cols_to_poly].values
+        X_poly_in = X[self.cols_to_poly].values
         
         # Tworzymy transformator tylko przy fit
         if self.poly_transformer is None:
@@ -357,20 +392,46 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         X_poly_out = self.poly_transformer.transform(X_poly_in)
         
         # Nazwy nowych cech
-        new_feature_names = self.poly_transformer.get_feature_names_out(cols_to_poly)
+        self.cols_to_poly_new_names = self.poly_transformer.get_feature_names_out(self.cols_to_poly)
         
         # Tworzymy DataFrame i łączymy z oryginałem
         # Uwaga: PolynomialFeatures zwraca też oryginalne kolumny (x, y), a potem (x*y).
         # Żeby nie dublować, bierzemy tylko te nowe, które mają znak mnożenia " " (spacja w sklearn) lub "*"
         
-        X_poly_df = pd.DataFrame(X_poly_out, columns=new_feature_names, index=X.index)
+        X_poly_df = pd.DataFrame(X_poly_out, columns=self.cols_to_poly_new_names, index=X.index)
         
         # Filtrujemy, żeby zostawić tylko nowe interakcje (te, których nie ma w X)
-        new_cols = [c for c in new_feature_names if c not in X.columns]
+        new_cols = [c for c in self.cols_to_poly_new_names if c not in X.columns]
+
+        if new_cols:
+            X = pd.concat([X, X_poly_df[new_cols]], axis=1)
+            self.num_cols.extend(new_cols)
+            
+        return X
+
+
+    def _transform_interactions(self, X):
+        """Transformacja interakcji przy użyciu wyuczonego transformatora."""
+        if not self.add_poly_features or self.poly_transformer is None:
+            return X
+        
+        if not self.cols_to_poly:
+            return X
+
+        X_poly_in = X[self.cols_to_poly].values
+        
+        # Transformacja
+        X_poly_out = self.poly_transformer.transform(X_poly_in)
+        
+        # Tworzymy DataFrame i łączymy z oryginałem
+        X_poly_df = pd.DataFrame(X_poly_out, columns=self.cols_to_poly_new_names, index=X.index)
+        
+        # Filtrujemy, żeby zostawić tylko nowe interakcje (te, których nie ma w X)
+        new_cols = [c for c in self.cols_to_poly_new_names if c not in X.columns]
         
         if new_cols:
             X = pd.concat([X, X_poly_df[new_cols]], axis=1)
-            
+        
         return X
 
     def _remove_collinear(self, X):
@@ -380,12 +441,11 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
         # Obliczamy macierz korelacji (wartość bezwzględna, bo -0.99 to też silna korelacja)
         # Robimy to tylko dla kolumn numerycznych
-        numeric_df = X.select_dtypes(include=['number'])
         
-        if numeric_df.empty:
+        if not self.num_cols:
             return X
 
-        corr_matrix = numeric_df.corr().abs()
+        corr_matrix = X[self.num_cols].corr().abs()
 
         # Wybieramy górny trójkąt macierzy (żeby nie sprawdzać A z B i B z A)
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
@@ -397,10 +457,251 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         self.collinear_drop_cols = to_drop
         
         if to_drop:
-            print(f"--- Współliniowość: Usunięto {len(to_drop)} kolumn (korelacja > {self.multicollinearity_threshold}) ---")
+            n_total = X.shape[1]
+            print(f"--- Współliniowość: Usunięto {len(to_drop)} z {n_total} kolumn (korelacja > {self.multicollinearity_threshold}) ---")
             # print(f"-> Usunięte: {to_drop}") # Opcjonalnie wypisz nazwy
+        
+        self.num_cols = [c for c in self.num_cols if c not in self.collinear_drop_cols]
+        return X.drop(columns=self.collinear_drop_cols)
+    
+    def _detect_useless_features(self, X):
+        """
+        Wykrywa kolumny stałe (0 wariancji) oraz kolumny ID (zbyt wysoka unikalność).
+        ZABEZPIECZENIE: Nie usuwa kolumn, które wyglądają jak daty.
+        """
+        self.cols_to_drop_early = []
+        
+        n_rows = len(X)
+        if n_rows == 0: return
+
+        for col in X.columns:
+            # 1. Kolumny STAŁE (tylko 1 wartość)
+            if X[col].nunique(dropna=False) <= 1:
+                self.cols_to_drop_early.append(col)
+                continue
             
-        return X.drop(columns=to_drop)
+            # 2. Kolumny ID (High Cardinality)
+            # Sprawdzamy to TYLKO dla obiektów/kategorii. 
+            if X[col].dtype == 'object' or hasattr(X[col], 'cat'):
+                n_unique = X[col].nunique()
+                
+                if n_unique / n_rows > self.id_threshold:
+                    
+                    # Zanim usuniemy, sprawdzamy czy to nie jest data (np. timestamp)
+                    # Timestampy są unikalne, ale niosą cenną informację!
+                    is_date_candidate = False
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            # Bierzemy próbkę niepustych wartości
+                            sample = X[col].dropna().iloc[:100]
+                            if len(sample) > 0:
+                                # Sprawdzamy czy to nie są same cyfry (bo ID=12345 to nie data)
+                                # Jeśli to tekstowe liczby, to na pewno ID, więc pozwalamy usunąć.
+                                if sample.astype(str).str.isnumeric().all():
+                                    is_date_candidate = False
+                                else:
+                                    # Próba konwersji na datę
+                                    pd.to_datetime(sample, errors='raise')
+                                    is_date_candidate = True
+                    except (ValueError, TypeError):
+                        is_date_candidate = False
+                    
+                    if is_date_candidate:
+                        # To wygląda na datę, więc JEJ NIE USUWAMY mimo wysokiej unikalności
+                        continue
+                    
+                    # Jeśli dotarliśmy tutaj, to nie jest data, a ma dużą unikalność -> ID -> Usuwamy
+                    self.cols_to_drop_early.append(col)
+
+        if self.cols_to_drop_early:
+            print(f"--- Wstępne czyszczenie: Usunięto {len(self.cols_to_drop_early)} kolumn (stałe lub ID) ---")
+            # print(f"-> Usunięte: {self.cols_to_drop_early}")
+
+        def _fit_feature_selection(self, X, y):
+            """
+            Inteligentna selekcja cech:
+            1. ENSEMBLE SCREENING (L1 + ExtraTrees):
+            - Usuwa zmienne, które są słabe ZARÓWNO liniowo, jak i nieliniowo.
+            - To jest 'miękkie' wstępne czyszczenie.
+            2. HYBRYDOWA REDUKCJA:
+            - Jeśli cech zostało mało (<60) -> SFS Backward (Maksymalna precyzja).
+            - Jeśli cech zostało dużo (>60) -> PCA (Kompresja informacji).
+            """
+            if not self.feature_selection:
+                self.selection_mode = None
+                return
+
+            print(f"\n--- Inteligentna Selekcja Cech (Hybrid) ---")
+            X_curr = X.copy()
+            initial_cols = X_curr.columns.tolist()
+            n_start = len(initial_cols)
+            
+            # Próg przełączenia między SFS a PCA
+            SFS_CAP_THRESHOLD = 75
+
+            # ==========================================
+            # ETAP 1: ENSEMBLE SCREENING (L1 + ExtraTrees)
+            # ==========================================
+            print(f"-> Etap 1: Wstępne usuwanie szumu (L1 + ExtraTrees)...")
+            
+            try:
+                # A. Ocena Liniowa (L1 / Lasso)
+                # C=0.5 to umiarkowana regularyzacja. threshold='0.1*mean' jest bardzo łagodny.
+                # Chcemy wyrzucić tylko totalne zera.
+                l1_model = LogisticRegression(penalty='l1', C=0.5, solver='liblinear', random_state=self.random_state, class_weight='balanced')
+                l1_selector = SelectFromModel(estimator=l1_model, threshold="0.1*mean")
+                l1_selector.fit(X_curr, y)
+                mask_l1 = l1_selector.get_support()
+                
+                # B. Ocena Nieliniowa (ExtraTrees)
+                # Drzewa widzą interakcje.
+                et_model = ExtraTreesClassifier(n_estimators=50, random_state=self.random_state, n_jobs=-1, class_weight='balanced')
+                et_selector = SelectFromModel(estimator=et_model, threshold="0.1*mean")
+                et_selector.fit(X_curr, y)
+                mask_et = et_selector.get_support()
+                
+                # C. Suma Zbiorów (Union)
+                # Zostawiamy cechę, jeśli L1 LUB Drzewa uważają ją za ważną.
+                final_mask = mask_l1 | mask_et # Bitwise OR
+                
+                # Aktualizacja danych
+                filtered_cols = np.array(initial_cols)[final_mask].tolist()
+                
+                # Zabezpieczenie: jeśli algorytm chce usunąć wszystko (mało prawdopodobne), bierzemy wynik ExtraTrees
+                if len(filtered_cols) < 2:
+                    print("   Uwaga: Ensemble chciał usunąć prawie wszystko. Cofam do wyniku samych drzew.")
+                    filtered_cols = np.array(initial_cols)[mask_et].tolist()
+
+                X_curr = X_curr[filtered_cols]
+                n_after_screen = len(filtered_cols)
+                
+                n_dropped = n_start - n_after_screen
+                print(f"   L1 wybrało: {sum(mask_l1)}, Trees wybrało: {sum(mask_et)}")
+                print(f"   Wspólna decyzja: Zachowano {n_after_screen} z {n_start} cech (usunięto {n_dropped} najsłabszych).")
+
+            except Exception as e:
+                print(f"   Błąd w Screeningu ({e}). Pomijam ten etap.")
+                filtered_cols = initial_cols
+                n_after_screen = n_start
+
+            # Zapamiętujemy stan po screeningu na wypadek błędu w etapie 2
+            self.final_selected_cols = filtered_cols
+
+            # ==========================================
+            # ETAP 2: DECYZJA (PCA vs SFS)
+            # ==========================================
+            # LOGIKA HYBRYDOWA
+            if n_after_screen <= SFS_CAP_THRESHOLD:
+                # --- ŚCIEŻKA A: Mało cech -> SFS (Precyzja) ---
+                print(f"-> Etap 2: Liczba cech ({n_after_screen}) <= {SFS_CAP_THRESHOLD}. Uruchamiam SFS Backward.")
+                
+                self.selection_mode = 'sfs'
+                
+                est = LogisticRegression(class_weight='balanced', solver='liblinear', random_state=self.random_state)
+                
+                self.selector_model = SequentialFeatureSelector(
+                    est,
+                    direction='backward',
+                    scoring='roc_auc',
+                    cv=3,
+                    n_jobs=-1
+                )
+                
+                try:
+                    self.selector_model.fit(X_curr, y)
+                    support_sfs = self.selector_model.get_support()
+                    self.final_selected_cols = np.array(filtered_cols)[support_sfs].tolist()
+                    print(f"-> SFS zakończony. Wybrano {len(self.final_selected_cols)} najlepszych cech.")
+                except Exception as e:
+                    print(f"   Błąd SFS ({e}). Zostawiam wynik po screeningu.")
+                    self.selection_mode = 'filter_only'
+                    # final_selected_cols już jest ustawione na filtered_cols
+
+            else:
+                # --- ŚCIEŻKA B: Dużo cech -> PCA (Kompresja) ---
+                print(f"-> Etap 2: Liczba cech ({n_after_screen}) > {SFS_CAP_THRESHOLD}. Uruchamiam PCA dla wydajności.")
+                
+                self.selection_mode = 'pca'
+                
+                # AUTOMATYCZNY DOBÓR:
+                # To eliminuje współliniowość i szum, ale zostawia prawie cały sygnał.
+                target_variance = 0.99
+                
+                # Bezpiecznik: PCA nie może stworzyć więcej komponentów niż mamy próbek
+                # (choć sklearn z floatem i tak by to obsłużył, svd_solver='full' jest precyzyjny)
+                self.pca_model = PCA(n_components=target_variance, random_state=self.random_state, svd_solver='full')
+                
+                # Uczymy PCA na kolumnach, które przeszły screening
+                self.final_selected_cols = filtered_cols 
+                
+                # Fitujemy
+                self.pca_model.fit(X_curr)
+                
+                n_comps = self.pca_model.n_components_
+                var_explained = np.sum(self.pca_model.explained_variance_ratio_)
+                
+                print(f"-> PCA zakończone. Skompresowano {n_after_screen} cech do {n_comps} komponentów.")
+                print(f"   Wyjaśniona wariancja: {var_explained:.4f} (Cel: {target_variance})")
+            
+            # ==========================================
+            # ETAP 3: AKTUALIZACJA LISTY KOLUMN (KLUCZOWE!)
+            # ==========================================
+            if self.selection_mode == 'pca':
+                # PCA tworzy zupełnie nowe kolumny numeryczne (PC1, PC2...)
+                # Tracimy oryginalne kategorie i liczby.
+                n_comps = self.pca_model.n_components_
+                new_pca_cols = [f"PC{i+1}" for i in range(n_comps)]
+                
+                self.num_cols = new_pca_cols
+                self.cat_cols = [] # Po PCA nie ma już kategorii
+                
+            else:
+                # SFS lub Filter - tylko filtrujemy istniejące listy
+                # Musimy zostawić tylko te, które są w final_selected_cols
+                final_set = set(self.final_selected_cols)
+                
+                self.num_cols = [c for c in self.num_cols if c in final_set]
+                self.cat_cols = [c for c in self.cat_cols if c in final_set]
+    
+    def _transform_feature_selection(self, X):
+        """Aplikuje selekcję/transformację zgodnie z ustalonym trybem."""
+        if self.selection_mode is None:
+            return X
+            
+        # Krok 1: Wybieramy kolumny po screeningu (wspólne dla wszystkich trybów)
+        # Musimy sprawdzić, czy cols są w X (bo usuwanie kolinearności mogło namieszać, choć nie powinno)
+        if hasattr(self, 'final_selected_cols') and self.final_selected_cols:
+            valid_cols = [c for c in self.final_selected_cols if c in X.columns]
+            
+            # Jeśli tryb to PCA, to final_selected_cols to kolumny WEJŚCIOWE do PCA
+            X_subset = X[valid_cols]
+            
+            if self.selection_mode == 'pca' and self.pca_model:
+                X_pca = self.pca_model.transform(X_subset)
+                cols = [f"PC{i+1}" for i in range(X_pca.shape[1])]
+                return pd.DataFrame(X_pca, columns=cols, index=X.index)
+            
+            # Jeśli tryb to 'sfs' lub 'filter_only', to final_selected_cols to już wynik końcowy
+            return X_subset
+
+        return X
+
+
+
+    def get_categorical_cols(self, X_processed):
+        """
+        Zwraca listę kolumn kategorycznych, które znajdują się w przetworzonym zbiorze danych.
+        Przydatne dla CatBoost/XGBoost po selekcji cech (SFS).
+        """
+        if self.feature_selection_method == 'pca':
+            # PCA zamienia wszystko na liczby (PC1, PC2...), więc nie ma już kategorii.
+            return []
+        
+        # Sprawdzamy, które z oryginalnie wykrytych kategorii przetrwały usuwanie i selekcję
+        # X_processed to DataFrame zwrócony przez transform()
+        valid_cats = [col for col in self.cat_cols if col in X_processed.columns]
+        return valid_cats
 
     def fit(self, X, y):
         # Zabezpieczenie na wypadek gdyby fit było wołane ręcznie bez process()
@@ -411,6 +712,11 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         X = X.copy()
         y_proc = self._process_target(y, fit=True)
         
+        # Wczesne usuwanie bezużytecznych cech
+        self._detect_useless_features(X)
+        if self.cols_to_drop_early:
+            X = X.drop(columns=self.cols_to_drop_early)
+        
         # 1. Wykrywanie typów i daty
         self._detect_columns(X)
         X = self._process_dates_cyclical(X)
@@ -418,17 +724,21 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         current_cols = X.columns
         self.num_cols = [c for c in current_cols if c not in self.cat_cols]
 
+        # braki w danych - imputacja
         if self.num_cols:
             self.imputer_num.fit(X[self.num_cols])
+            self.cols_to_impute_num = self.num_cols.copy()
             X[self.num_cols] = self.imputer_num.transform(X[self.num_cols])
         if self.cat_cols:
             self.imputer_cat.fit(X[self.cat_cols])
+            self.cols_to_impute_cat = self.cat_cols.copy()
             X[self.cat_cols] = self.imputer_cat.transform(X[self.cat_cols])
 
+        # Skalowanie i transformacja Yeo-Johnson
         if self.num_cols:
             self.power_transformer.fit(X[self.num_cols])
             X[self.num_cols] = self.power_transformer.transform(X[self.num_cols])
-
+        # Encoding kategorii
         if self.cat_cols:
             X[self.cat_cols] = X[self.cat_cols].astype(str)
             self.cat_encoder.fit(X[self.cat_cols])
@@ -440,92 +750,37 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         if self.add_kmeans_features:
             self._fit_kmeans(X)
             X = self._transform_with_kmeans(X)
-            self.num_cols.extend(self.kmeans_cols)
 
         # B. Interakcje (na podstawie num_cols + kmeans_cols)
         if self.add_poly_features:
             self.poly_transformer = None 
             X = self._add_interactions(X)
-            # Aktualizujemy listę numerycznych o nowe interakcje
-            # (bierzemy różnicę zbiorów, żeby nie dodać czegoś dwa razy)
-            all_num = X.select_dtypes(include=['number']).columns.tolist()
-            new_poly = [c for c in all_num if c not in self.num_cols]
-            self.num_cols.extend(new_poly)
 
         # --- 3. Czyszczenie (Współliniowość) ---
         # Robimy to PO wygenerowaniu wszystkiego, żeby usunąć np. interakcje skorelowane z oryginałem
         if self.remove_multicollinearity:
             X = self._remove_collinear(X)
-            # WAŻNE: Aktualizacja self.num_cols po usunięciu
-            self.num_cols = [c for c in self.num_cols if c not in self.collinear_drop_cols]
-
-        # --- 4. Selekcja Cech (PCA / SFS) ---
-        if self.feature_selection_method is not None:
-            X_full = X.values
-            n_current_features = X.shape[1]
-            
-            if isinstance(self.n_features, float):
-                n_to_keep = int(n_current_features * self.n_features)
-            else:
-                n_to_keep = self.n_features
-            n_to_keep = max(1, min(n_to_keep, n_current_features))
-
-            if self.feature_selection_method == 'pca':
-                print(f"\n--- Uruchamianie redukcji PCA ---")
-                print(f"-> Cechy przed: {n_current_features}, Cel: {n_to_keep}")
-                self.selector = PCA(n_components=n_to_keep, random_state=self.random_state)
-                self.selector.fit(X_full)
-                
-            elif self.feature_selection_method == 'sfs':
-                if y_proc is None:
-                    print("Uwaga: Brak targetu (y), pomijam SFS.")
-                else:
-                    print(f"\n--- Uruchamianie selekcji SFS (Backward) ---")
-                    print(f"-> Estymator bazowy: LogisticRegression (balanced)")
-                    print(f"-> Cechy na wejściu: {n_current_features}")
-                    
-                    est = LogisticRegression(class_weight='balanced', solver='liblinear', random_state=self.random_state)
-                    
-                    self.selector = SequentialFeatureSelector(
-                        est, 
-                        direction='backward',
-                        scoring='roc_auc',
-                        cv=3,
-                        n_jobs=-1
-                        # n_features_to_select='auto' (domyślnie redukuje o połowę lub wg tolerancji)
-                    )
-                    
-                    # 1. Fitowanie selektora
-                    self.selector.fit(X_full, y_proc)
-                    
-                    # 2. Analiza wyników
-                    support = self.selector.get_support()
-                    selected_cols = X.columns[support].tolist()
-                    dropped_cols = X.columns[~support].tolist()
-                    n_selected = len(selected_cols)
-                    
-                    print(f"-> SFS zakończony sukcesem.")
-                    print(f"-> Pozostawiono: {n_selected} cech (usunięto {len(dropped_cols)})")
-                    
-                    # 4. Wypisanie nazw (jeśli nie jest ich tysiąc)
-                    if n_selected <= 50:
-                        print(f"-> [LISTA] Wybrane cechy: {selected_cols}")
-                    else:
-                        print(f"-> [LISTA] Wybrane cechy (pierwsze 50): {selected_cols[:50]}...")
-                        
-                    if dropped_cols and len(dropped_cols) <= 50:
-                        print(f"-> [LISTA] Odrzucone cechy: {dropped_cols}")
-
+        
+        # --- 4. Selekcja Cech ---
+        if self.feature_selection:
+            self._fit_feature_selection(X, y_proc)
+            X = self._transform_feature_selection(X)
+            self.num_cols = [c for c in self.num_cols if c in X.columns]
+            self.cat_cols = [c for c in self.cat_cols if c in X.columns]
         self.is_fitted = True
         return self
 
-    def transform(self, X, y=None): # <--- POPRAWKA: y=None
+    def transform(self, X, y=None):
         if not self.is_fitted:
             raise Exception("Najpierw uruchom fit()!")
         
         X = X.copy()
         y_transformed = self._process_target(y, fit=False)
         
+        if self.cols_to_drop_early:
+            # errors='ignore' na wypadek gdyby w X (np. testowym) tych kolumn w ogóle nie było
+            X = X.drop(columns=self.cols_to_drop_early, errors='ignore')
+
         X = self._process_dates_cyclical(X)
         
         # Imputacja/Skalowanie (tylko dla kolumn z num_cols, które przetrwały w fit)
@@ -540,25 +795,24 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         # Ale imputery były uczone NA PEŁNYM zestawie przed dropowaniem.
         
         # Bezpieczniej jest użyć kolumn na których imputery były uczone:
-        if hasattr(self.imputer_num, "feature_names_in_"):
-             cols_to_impute = self.imputer_num.feature_names_in_
-        else:
-             # Fallback jeśli starszy sklearn - bierzemy te z X co pasują do typów numerycznych
-             # (to uproszczenie, ale zazwyczaj działa)
-             cols_to_impute = X.select_dtypes(include=['number']).columns
+        # if hasattr(self.imputer_num, "feature_names_in_"):
+        #      cols_to_impute = self.imputer_num.feature_names_in_
+        # else:
+        #      # Fallback jeśli starszy sklearn - bierzemy te z X co pasują do typów numerycznych
+        #      # (to uproszczenie, ale zazwyczaj działa)
+        #      cols_to_impute = X.select_dtypes(include=['number']).columns
         
         # Filtrujemy tylko te które są w obecnym X
-        valid_impute = [c for c in cols_to_impute if c in X.columns]
+        valid_impute = [c for c in self.cols_to_impute_num if c in X.columns]
         if len(valid_impute) > 0:
             X[valid_impute] = self.imputer_num.transform(X[valid_impute])
             X[valid_impute] = self.power_transformer.transform(X[valid_impute])
 
-        if self.cat_cols:
-            valid_cat = [c for c in self.cat_cols if c in X.columns]
-            if valid_cat:
-                X[valid_cat] = self.imputer_cat.transform(X[valid_cat])
-                X[valid_cat] = X[valid_cat].astype(str)
-                X[valid_cat] = self.cat_encoder.transform(X[valid_cat])
+        valid_impute = [c for c in self.cols_to_impute_cat if c in X.columns]
+        if len(valid_impute) > 0:
+            X[valid_impute] = self.imputer_cat.transform(X[valid_impute])
+            X[valid_impute] = X[valid_impute].astype(str)
+            X[valid_impute] = self.cat_encoder.transform(X[valid_impute])
 
         # --- Generowanie Cech (Kolejność jak w fit!) ---
         
@@ -566,7 +820,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             X = self._transform_with_kmeans(X)
 
         if self.add_poly_features:
-            X = self._add_interactions(X)
+            X = self._transform_interactions(X)
 
         # --- Czyszczenie (Współliniowość) ---
         if self.remove_multicollinearity and self.collinear_drop_cols:
@@ -575,18 +829,11 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             X = X.drop(columns=cols_to_drop)
 
         # --- Selekcja ---
-        if self.selector:
-            X_values = X.values
-            X_transformed = self.selector.transform(X_values)
-            
-            if self.feature_selection_method == 'pca':
-                cols = [f"PC{i+1}" for i in range(X_transformed.shape[1])]
-                X = pd.DataFrame(X_transformed, columns=cols, index=X.index)
-            else:
-                support = self.selector.get_support()
-                cols = X.columns[support]
-                X = pd.DataFrame(X_transformed, columns=cols, index=X.index)
-    
+        if self.feature_selection:
+            X = self._transform_feature_selection(X)
+        
+        if y is None:
+            return X
         return X, y_transformed
     
     def fit_transform(self, X, y):
@@ -600,13 +847,16 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         y_proc = y.copy() if y is not None else None
         
         # 3. Wykrywanie Outlierów (OPCJONALNE)
-        if self.remove_outliers and self.num_cols:
+        if self.remove_outliers and self.original_num_cols:
             # Tworzymy TYMCZASOWĄ wersję danych tylko dla algorytmu IsolationForest.
             # Musimy zamienić daty i braki na liczby, żeby algorytm zadziałał.
             temp_X = X_proc.copy()
+            if self.cols_to_drop_early:
+                X_proc = X_proc.drop(columns=self.cols_to_drop_early)
+
             temp_X = self._process_dates_cyclical(temp_X)
             
-            valid_num = [c for c in self.num_cols if c in temp_X.columns]
+            valid_num = [c for c in self.original_num_cols if c in temp_X.columns]
             if valid_num:
                 temp_X[valid_num] = self.imputer_num.transform(temp_X[valid_num])
                 temp_X[valid_num] = self.power_transformer.transform(temp_X[valid_num])
