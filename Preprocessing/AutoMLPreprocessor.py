@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import LabelEncoder
-from sklearn.preprocessing import PolynomialFeatures, StandardScaler, PowerTransformer, OrdinalEncoder
+from sklearn.preprocessing import KBinsDiscretizer, PolynomialFeatures, StandardScaler, PowerTransformer, OrdinalEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import ExtraTreesClassifier, IsolationForest
@@ -101,6 +101,15 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         self.cols_to_impute_cat = [] # Lista kolumn do imputacji kategorycznej
         self.power_transformer = PowerTransformer(method='yeo-johnson', standardize=True)
         self.cat_encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+
+        # Frequency Encoding
+        self.freq_enc_map = {} # Słownik do trzymania mapowań: { 'Kolumna': { 'Wartosc': 0.5, ... } }
+        self.freq_cols = []    # Lista kolumn, które kodujemy
+
+        #-- Nowe pola dla Binning ---
+        self.binning_transformer = None
+        self.binning_cols = []       # Kolumny źródłowe
+        self.binning_new_names = []  # Nazwy nowych kolumn BIN_...
 
         # --- Nowe pola dla KMeans ---
         self.add_kmeans_features = add_kmeans_features
@@ -319,6 +328,97 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
                 return np.zeros(len(y_filled), dtype=int)
                 
         return y_encoded
+    
+    def _fit_frequency_features(self, X):
+        """Uczy się częstości występowania kategorii na zbiorze treningowym."""
+        if not self.cat_cols:
+            return
+
+        # Wybieramy kandydatów (np. > 5 unikalnych wartości)
+        cols_to_process = [c for c in self.cat_cols if c in X.columns]
+        unique_counts = {c: X[c].nunique() for c in cols_to_process}
+        
+        # Bierzemy top 10 kolumn o największej liczności
+        candidates = [c for c, count in unique_counts.items() if count > 5]
+        self.freq_cols = sorted(candidates, key=lambda c: unique_counts[c], reverse=True)[:10]
+
+        self.freq_enc_map = {}
+        for col in self.freq_cols:
+            # Obliczamy częstość (procentowy udział)
+            freq_map = X[col].value_counts(normalize=True).to_dict()
+            self.freq_enc_map[col] = freq_map
+
+    def _transform_frequency_features(self, X):
+        """Aplikuje zapamiętane częstości do danych."""
+        if not self.freq_cols or not self.freq_enc_map:
+            return X
+        
+        new_feats = {}
+        for col in self.freq_cols:
+            if col in X.columns:
+                mapping = self.freq_enc_map[col]
+                # Mapujemy. fillna(0) jest kluczowe!
+                # Jeśli w teście pojawi się nowa kategoria (nieznana w treningu), dostanie 0.
+                new_feats[f'FREQ_{col}'] = X[col].map(mapping).fillna(0)
+        
+        if new_feats:
+            X_freq = pd.DataFrame(new_feats, index=X.index)
+            X = pd.concat([X, X_freq], axis=1)
+            
+            # W fit() dodajemy te kolumny do num_cols, tutaj tylko zwracamy X
+            # (aktualizację listy num_cols robimy tylko w głównym fit)
+            
+        return X    
+
+
+    def _fit_binning_features(self, X):
+        """Uczy się przedziałów (kwantyli) na zbiorze treningowym."""
+        # Logika wyboru kolumn (np. te same co do interakcji lub top numeryczne)
+        if hasattr(self, 'cols_to_poly') and self.cols_to_poly:
+            self.binning_cols = [c for c in self.cols_to_poly if c in X.columns]
+        else:
+            # Fallback: pierwsze 10 numerycznych
+            self.binning_cols = [c for c in self.num_cols if c in X.columns][:10]
+            
+        if not self.binning_cols:
+            return
+
+        # Inicjalizacja i nauka
+        self.binning_transformer = KBinsDiscretizer(
+            n_bins=5, encode='ordinal', strategy='quantile', subsample=200_000, random_state=self.random_state
+        )
+        
+        try:
+            self.binning_transformer.fit(X[self.binning_cols])
+            self.binning_new_names = [f'BIN_{c}' for c in self.binning_cols]
+        except Exception as e:
+            print(f"   Błąd fitowania Binningu: {e}")
+            self.binning_transformer = None
+            self.binning_cols = []
+
+    def _transform_binning_features(self, X):
+        """Aplikuje wyuczone przedziały."""
+        if self.binning_transformer is None or not self.binning_cols:
+            return X
+            
+        # Sprawdzamy obecność kolumn
+        valid_cols = [c for c in self.binning_cols if c in X.columns]
+        if len(valid_cols) != len(self.binning_cols):
+            # Jeśli brakuje kolumn (rzadkie), pomijamy transformację dla bezpieczeństwa
+            return X
+
+        try:
+            X_binned = self.binning_transformer.transform(X[self.binning_cols])
+            
+            X_bin_df = pd.DataFrame(X_binned, columns=self.binning_new_names, index=X.index)
+            X = pd.concat([X, X_bin_df], axis=1)
+            
+        except Exception as e:
+            # W rzadkich przypadkach (np. zbyt mała wariancja w kolumnie) może rzucić błąd
+            pass
+            
+        return X
+
 
     def _fit_kmeans(self, X):
         """Logika uczenia KMeans inspirowana biblioteką MLJAR."""
@@ -367,14 +467,16 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
     def _add_poly_features(self, X, y):
         """
-        Tworzy interakcje między zmiennymi numerycznymi.
-        Wybiera top NUM_OF_FEATURES_LIMIT cech przy użyciu ExtraTreesClassifier.
+        Generuje zaawansowane cechy inżynierskie:
+        1. Unarne: log(x), x^2
+        2. Binarne (pary najważniejszych cech): A+B, A-B, A*B, A/B
         """
         if not self.add_poly_features:
             return X
         
-        NUM_OF_FEATURES_LIMIT = 5
-
+        # Limit cech bazowych, z których robimy kombinacje.
+        # Jeśli dasz 5, to par będzie 5 po 2 = 10 par. Każda para ma 4 operacje (+,-,*,/) = 40 nowych cech.
+        NUM_OF_FEATURES_LIMIT = 6
 
         # Bierzemy tylko numeryczne, żeby nie mnożyć kategorii
         valid_cols = [c for c in self.num_cols if c in X.columns]
@@ -412,46 +514,78 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         else:
             # Jeśli mało kolumn, bierzemy wszystkie
             self.cols_to_poly = valid_cols
-
-        # Inicjalizacja transformatora na wybranych kolumnach
-        # degree=2, interaction_only=True -> tworzy tylko A*B
-        self.poly_transformer = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
-        X_poly_out = self.poly_transformer.fit_transform(X[self.cols_to_poly])
-
-        self.cols_to_poly_new_names = self.poly_transformer.get_feature_names_out(self.cols_to_poly)
-        
-        # Tworzymy DataFrame
-        X_poly_df = pd.DataFrame(X_poly_out, columns=self.cols_to_poly_new_names, index=X.index)
-        
-        # Filtrujemy, żeby zostawić tylko nowe interakcje (te, których nie ma w X)
-        new_cols = [c for c in self.cols_to_poly_new_names if c not in X.columns]
-
-        if new_cols:
-            X = pd.concat([X, X_poly_df[new_cols]], axis=1)
-            self.num_cols.extend(new_cols)
-            print(f"--- Interakcje: Dodano {len(new_cols)} nowych cech wielomianowych ---")
             
-        return X
+        # --- GENEROWANIE CECH ---
+        # Tutaj wywołujemy logikę transformacji od razu, żeby zaktualizować X
+        # Nie potrzebujemy 'fit' dla matematyki (dodawanie to dodawanie), 
+        # musimy tylko pamiętać 'cols_to_poly' (co zrobiliśmy wyżej).
+        
+        return self._transform_poly_features(X)
 
 
     def _transform_poly_features(self, X):
-        """Transformacja interakcji przy użyciu wyuczonego transformatora."""
-        if not self.add_poly_features or self.poly_transformer is None or not self.cols_to_poly:
+        """Aplikuje operacje matematyczne na wybranych kolumnach."""
+        if not self.add_poly_features or not hasattr(self, 'cols_to_poly') or not self.cols_to_poly:
             return X
         
-        X_poly_in = X[self.cols_to_poly].values
+        # Sprawdzamy czy wybrane kolumny są w X
+        valid_cols = [c for c in self.cols_to_poly if c in X.columns]
+        if len(valid_cols) < 1:
+            return X
         
-        # Transformacja
-        X_poly_out = self.poly_transformer.transform(X_poly_in)
+        new_features = {}
+        epsilon = 1e-6 # Zabezpieczenie przed dzieleniem przez zero
         
-        # Tworzymy DataFrame i łączymy z oryginałem
-        X_poly_df = pd.DataFrame(X_poly_out, columns=self.cols_to_poly_new_names, index=X.index)
+        # A. Transformacje UNARNE (pojedyncze kolumny)
+        for col in valid_cols:
+            # 1. Logarytm (bezpieczny: log(abs(x) + 1))
+            # Obsługuje ujemne wartości zamieniając je na log z modułu
+            new_features[f'LOG_{col}'] = np.log1p(np.abs(X[col]))
+            
+            # 2. Kwadrat (zastępuje PolynomialFeatures degree=2 dla samego siebie)
+            new_features[f'SQR_{col}'] = X[col] ** 2
+            
+            # Opcjonalnie: Pierwiastek (tylko z modułu)
+            # new_features[f'SQRT_{col}'] = np.sqrt(np.abs(X[col]))
+
+        # B. Transformacje BINARNE (pary kolumn)
+        import itertools
+        # Tworzymy pary z wybranych kolumn (np. V1 i V4)
+        for col_a, col_b in itertools.combinations(valid_cols, 2):
+            val_a = X[col_a]
+            val_b = X[col_b]
+            
+            # 3. Mnożenie (Interakcja)
+            new_features[f'MUL_{col_a}_x_{col_b}'] = val_a * val_b
+            
+            # 4. A / B
+            # Logika: Jeśli val_b == 0, użyj epsilon. W przeciwnym razie użyj val_b.
+            # Nie dodajemy epsilona do liczb, które nie są zerem, żeby nie zniekształcać danych.
+            denom_b = np.where(val_b == 0, epsilon, val_b)
+            new_features[f'DIV_{col_a}_by_{col_b}'] = val_a / denom_b
+            
+            # W drugą stronę: B / A
+            denom_a = np.where(val_a == 0, epsilon, val_a)
+            new_features[f'DIV_{col_b}_by_{col_a}'] = val_b / denom_a
+            
+            # 5. Różnica (Difference)
+            new_features[f'SUB_{col_a}_{col_b}'] = val_a - val_b
+            
+            # 6. Suma (często mniej ważna dla drzew, ale może się przydać)
+            new_features[f'ADD_{col_a}_{col_b}'] = val_a + val_b
+
+        # Tworzenie DataFrame z nowych cech
+        X_new_feats = pd.DataFrame(new_features, index=X.index)
         
-        # Filtrujemy, żeby zostawić tylko nowe interakcje (te, których nie ma w X)
-        new_cols = [c for c in self.cols_to_poly_new_names if c not in X.columns]
+        # Filtrowanie duplikatów (jeśli już są w X - rzadkie, ale możliwe)
+        cols_to_add = [c for c in X_new_feats.columns if c not in X.columns]
         
-        if new_cols:
-            X = pd.concat([X, X_poly_df[new_cols]], axis=1)
+        if cols_to_add:
+            X = pd.concat([X, X_new_feats[cols_to_add]], axis=1)
+            # Aktualizacja listy numerycznych (tylko w fit, ale tu robimy trick sprawdzając typ)
+            # Jeśli wywołujemy to z transform(), to self.num_cols nie powinno się zmieniać trwale 
+            # w sposób, który zepsułby pipeline, ale dla spójności warto wiedzieć, że to liczby.
+            # (W metodzie fit() w klasie głównej i tak nadpisujesz num_cols na końcu, więc jest OK).
         
         return X
 
@@ -559,7 +693,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         n_start = len(initial_cols)
         
         # Próg przełączenia między SFS a PCA
-        SFS_CAP_THRESHOLD = 75
+        SFS_CAP_THRESHOLD = 10000
 
         # ==========================================
         # ETAP 1: ENSEMBLE SCREENING (L1 + ExtraTrees)
@@ -576,7 +710,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
                 class_weight = 'balanced', 
                 penalty = 'l1',
                 solver='liblinear',
-                max_iter = 100,
+                max_iter = 1000,
                 C = 0.5,
                 tol = 1e-3,
                 random_state = self.random_state
@@ -589,7 +723,12 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             # Drzewa widzą interakcje.
             print("   -> Ocena Nieliniowa (ExtraTreesClassifier)...")
             ETC_threshold = "0.34*mean"  # próg
-            et_model = ExtraTreesClassifier(n_estimators=75, min_samples_leaf=10, random_state=self.random_state, n_jobs=-1, class_weight='balanced')
+            et_model = ExtraTreesClassifier(
+                n_estimators=100, 
+                min_samples_leaf=10, 
+                class_weight='balanced',
+                random_state=self.random_state, 
+                n_jobs=-1)
             et_selector = SelectFromModel(estimator=et_model, threshold=ETC_threshold)
             et_selector.fit(X_curr, y)
             mask_et = et_selector.get_support()
@@ -634,15 +773,15 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             est = LogisticRegression(
                 class_weight='balanced', 
                 solver='liblinear',
-                max_iter= 100,
-                C=0.5,
-                tol=1e-5,
+                max_iter= 1000,
+                C=0.75,
+                tol=1e-3,
                 random_state=self.random_state
             )
             
             self.selector_model = SFS(
                 est,
-                k_features='parsimonious', # best lub parsimonious
+                k_features='best', # best lub parsimonious
                 forward=False, 
                 floating=False, 
                 verbose=1,  # (2 = szczegółowa)
@@ -703,9 +842,12 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             # Musimy zostawić tylko te, które są w final_selected_cols
             final_set = set(self.final_selected_cols)
             
-            self.num_cols = [c for c in self.num_cols if c in final_set]
-            self.cat_cols = [c for c in self.cat_cols if c in final_set]
-    
+            self.num_cols = [c for c in final_set if c in self.num_cols]
+            self.cat_cols = [c for c in final_set if c in self.cat_cols]
+        
+        print(f"--- Selekcja Cech Zakończona: Tryb = {self.selection_mode} ---\n")
+        print(f"Ostateczne kolumny:{self.num_cols + self.cat_cols}\n")
+
     def _transform_feature_selection(self, X):
         """Aplikuje selekcję/transformację zgodnie z ustalonym trybem."""
         if self.selection_mode is None:
@@ -788,15 +930,30 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
         # --- 2. Generowanie Cech (Feature Engineering) ---
         
-        # A. KMeans
+        # A. Frequency Encoding (Uczymy się mapy i transformujemy X)
+        self._fit_frequency_features(X)
+        X = self._transform_frequency_features(X)
+        # Aktualizacja listy numerycznej o nowe kolumny FREQ_
+        new_freq_cols = [c for c in X.columns if c.startswith('FREQ_')]
+        self.num_cols.extend(new_freq_cols)
+
+        # B. KMeans
         if self.add_kmeans_features:
             self._fit_kmeans(X)
             X = self._transform_with_kmeans(X)
 
-        # B. Interakcje (na podstawie num_cols + kmeans_cols)
+        # C. Interakcje (na podstawie num_cols + kmeans_cols)
         if self.add_poly_features:
             self.poly_transformer = None 
             X = self._add_poly_features(X, y_proc)
+
+        # D. Binning (Uczymy się przedziałów i transformujemy X)
+        self._fit_binning_features(X)
+        X = self._transform_binning_features(X)
+        # Aktualizacja listy numerycznej o nowe kolumny BIN_
+        # (Dla modeli drzewiastych traktujemy je jako numeryczne/ordinal)
+        if self.binning_new_names:
+            self.num_cols.extend(self.binning_new_names)
 
         # --- 3. Czyszczenie (Współliniowość) ---
         # Robimy to PO wygenerowaniu wszystkiego, żeby usunąć np. interakcje skorelowane z oryginałem
@@ -839,11 +996,15 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
         # --- Generowanie Cech (Kolejność jak w fit!) ---
         
+        X = self._transform_frequency_features(X)
+
         if self.add_kmeans_features:
             X = self._transform_with_kmeans(X)
 
         if self.add_poly_features:
             X = self._transform_poly_features(X)
+
+        X = self._transform_binning_features(X)
 
         # --- Czyszczenie (Współliniowość) ---
         if self.remove_multicollinearity and self.collinear_drop_cols:

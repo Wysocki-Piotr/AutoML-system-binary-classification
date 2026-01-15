@@ -9,15 +9,15 @@ pd.set_option('display.max_columns', None)
 cfg = pd.read_json("models_new.json").to_dict(orient="records")
 
 # Load dataset
-data = pd.read_csv("Datasets/taiwanese_bankruptcy_prediction_46962.csv")
-#data = pd.read_csv("Datasets/diabetes_46921.csv")
+#data = pd.read_csv("Datasets/qsar-biodeg_46952.csv")
+data = pd.read_csv("Datasets/diabetes_46921.csv")
 #data = pd.read_csv("Datasets/Amazon_employee_access_46905.csv")
 
 X = data.drop(columns=["target"])
 y = data["target"]
 
-# X = pd.read_csv("test_data/X.csv")
-# y = pd.read_csv("test_data/y.csv")
+X = pd.read_csv("test_data/X.csv")
+y = pd.read_csv("test_data/y.csv")
 
 
 
@@ -67,8 +67,8 @@ for model_config in cfg:
 # Convert to DataFrame for better visualization
 scores_df = pd.DataFrame(scores)
 
-# Sort the DataFrame by AUC in descending order
-scores_df = scores_df.sort_values(by="AUC", ascending=False)
+# Sort by Balanced Accuracy in descending order
+scores_df = scores_df.sort_values(by="Balanced Accuracy", ascending=False)
 
 # Print the sorted DataFrame
-print(scores_df)
+print(scores_df[["Model Name", "AUC", "Balanced Accuracy"]])
