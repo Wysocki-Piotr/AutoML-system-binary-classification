@@ -175,12 +175,10 @@ class MiniAutoML:
             if n_features > constraints.get("max_features", float("inf")):
                 continue
 
-            use_native_cat = (
-                    "categorical" in model_config["name"]
-                    or "CatBoost" in model_config["class"]
-            )
-
+            
             wrapper = ModelWrapper(model_config)
+            if "random_state" in wrapper.model.get_params():
+                wrapper.model.set_params(random_state=42)
             X_current = X_train_proc
 
             if "CatBoost" in model_config["class"] and cat_cols:
@@ -214,70 +212,6 @@ class MiniAutoML:
         leaderboard = pd.DataFrame(scores).sort_values(
             by="Metric Score", ascending=False
         ).reset_index(drop=True)
-
-        # ======================================================================
-        # STAGE 2: LIGHT OPTIMIZATION (Halving Strategy)
-        # ======================================================================
-        print("\n--- Stage 2: Light optimization (Top 3) ---")
-
-        top3 = leaderboard.head(3).to_dict("records")
-
-        for row in top3:
-            config = row["Config"]
-            search_space = config.get("search_space")
-            if not search_space:
-                print(f" No search space for {config['name']}, skipping optimization.")
-                continue
-
-
-            wrapper = ModelWrapper(config)
-
-            print(f"Optimizing {config['name']}...")
-            try:
-                search = HalvingRandomSearchCV(
-                    wrapper.model,
-                    search_space,
-                    n_candidates=1000,
-                    factor=2,
-                    scoring="balanced_accuracy",
-                    n_jobs=-1,
-                    cv=3,
-                    random_state=42,
-                    verbose=0
-                )
-
-                X_current = X_train_proc
-                if "CatBoost" in model_config["class"] and cat_cols:
-                    wrapper.model.set_params(cat_features=cat_cols)
-                elif "LGBMClassifier" in model_config["class"]:
-                    # Używamy wersji z typem 'category'
-                    X_current = X_train_cat
-                elif "XGBClassifier" in model_config["class"] and 'non_categorical' not in model_config["name"]:
-                    # Używamy wersji z typem 'category'
-                    X_current = X_train_cat
-                    wrapper.model.set_params(enable_categorical=True, tree_method="hist")
-
-                search.fit(X_current, y_train)
-                
-                if search.best_score_ > row["Metric Score"]:
-                    # Ważne: Tworzymy nowy wrapper i ustawiamy mu najlepsze parametry
-                    optimized_wrapper = ModelWrapper(config)
-                    optimized_wrapper.model.set_params(**search.best_params_)
-
-                    scores.append({
-                        "Model Name": f"{config['name']} (Opt)",
-                        "Model Class": config["class"],
-                        "Metric Score": search.best_score_,
-                        "Wrapper": optimized_wrapper,
-                        "Config": config,
-                        "Params": search.best_params_  # Zapisujemy najlepsze parametry
-                    })
-                    print(f"  -> Improved! BA: {search.best_score_:.4f}")
-            except Exception as e:
-                print(f" Optimization failed for {config['name']}: {e}")
-
-        # Odśwież leaderboard
-        leaderboard = pd.DataFrame(scores).sort_values(by="Metric Score", ascending=False).reset_index(drop=True)
 
         # ======================================================================
         # STAGE 3: STACKING (OPTIMIZED)
