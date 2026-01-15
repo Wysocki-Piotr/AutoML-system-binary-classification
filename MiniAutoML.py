@@ -127,13 +127,13 @@ class MiniAutoML:
         self.models_config = models_config
         self.metric = metric
         self.leaderboard = None
-        self.preprocessor = AutoMLPreprocessor(
+        self.preprocessor = AutoMLPreprocessor( # tunowane parametry, lepiej nie zmieniać
                  add_kmeans_features=True,
                  feature_selection= True,
                  add_poly_features=True, 
-                 remove_outliers=True, 
+                 remove_outliers=False,
                  remove_multicollinearity=True, 
-                 multicollinearity_threshold=0.99, 
+                 multicollinearity_threshold=0.95, 
                  id_threshold=0.95,
                  random_state=42)
         self.best_model = None

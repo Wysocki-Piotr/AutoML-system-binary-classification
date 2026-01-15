@@ -17,11 +17,14 @@ from mlxtend.feature_selection import SequentialFeatureSelector as SFS
 import warnings
 
 class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
-    def __init__(self, target_col=None, add_kmeans_features=True,
+    def __init__(self, target_col=None, 
+                 add_kmeans_features=True,
                  feature_selection=True, # opcje to True, False
-                 add_poly_features=False, remove_outliers=True, 
+                 add_poly_features=True, 
+                 remove_outliers=False, # bardzo zle przy niezbalansowanych, lepiej False
+                 remove_multicollinearity=True, # istotne do selekcji cech
+                 multicollinearity_threshold=0.95,
                  id_threshold=0.95,
-                 remove_multicollinearity=True, multicollinearity_threshold=0.95,
                  random_state=None):
         
         """
@@ -362,44 +365,62 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         
         return X_out
 
-    def _add_interactions(self, X):
-        """Tworzy interakcje między zmiennymi numerycznymi (mnożenie)."""
+    def _add_poly_features(self, X, y):
+        """
+        Tworzy interakcje między zmiennymi numerycznymi.
+        Wybiera top NUM_OF_FEATURES_LIMIT cech przy użyciu ExtraTreesClassifier.
+        """
         if not self.add_poly_features:
             return X
-            
+        
+        NUM_OF_FEATURES_LIMIT = 5
+
+
         # Bierzemy tylko numeryczne, żeby nie mnożyć kategorii
         valid_cols = [c for c in self.num_cols if c in X.columns]
         
-        # Jeśli mamy za dużo kolumn, to PolynomialFeatures wybuchnie.
-        # Ograniczmy się np. do 10-15 najważniejszych lub po prostu wszystkich jeśli jest ich mało.
-        if len(valid_cols) > 20:
-            # Wersja prosta: bierzemy pierwsze 20 (można tu dodać logikę wyboru np. wariancji)
-            self.cols_to_poly = valid_cols[:20]
-        else:
-            self.cols_to_poly = valid_cols
-
-        if not self.cols_to_poly:
+        if not valid_cols:
             return X
 
-        X_poly_in = X[self.cols_to_poly].values
-        
-        # Tworzymy transformator tylko przy fit
-        if self.poly_transformer is None:
-            # degree=2: tworzy A^2, A*B, B^2
-            # interaction_only=True: tworzy tylko A*B (bez kwadratów), to często lepsze i lżejsze
-            self.poly_transformer = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
-            self.poly_transformer.fit(X_poly_in)
-            
-        # Transformacja
-        X_poly_out = self.poly_transformer.transform(X_poly_in)
-        
-        # Nazwy nowych cech
+        if len(valid_cols) > NUM_OF_FEATURES_LIMIT:
+            if y is not None:
+                print(f"   -> Wybieranie top {NUM_OF_FEATURES_LIMIT} cech do interakcji (ExtraTrees)...")
+                try:
+                    # Lekki model do szybkiego rankingu
+                    et = ExtraTreesClassifier(
+                        n_estimators=50, 
+                        max_depth=5,     # Płytkie drzewa wystarczą do oceny ważności
+                        n_jobs=-1, 
+                        random_state=self.random_state,
+                        class_weight='balanced'
+                    )
+                    et.fit(X[valid_cols], y)
+                    
+                    # Pobieramy ważności i sortujemy
+                    importances = et.feature_importances_
+                    indices = np.argsort(importances)[::-1] # Indeksy malejąco
+                    top_indices = indices[:NUM_OF_FEATURES_LIMIT]
+                    
+                    self.cols_to_poly = [valid_cols[i] for i in top_indices]
+                    print(f"   Wybrane kolumny do interakcji: {self.cols_to_poly}")
+                except Exception as e:
+                    print(f"   Błąd selekcji do interakcji ({e}). Biorę pierwsze {NUM_OF_FEATURES_LIMIT}.")
+                    self.cols_to_poly = valid_cols[:NUM_OF_FEATURES_LIMIT]
+            else:
+                # Fallback jeśli brak y
+                self.cols_to_poly = valid_cols[:NUM_OF_FEATURES_LIMIT]
+        else:
+            # Jeśli mało kolumn, bierzemy wszystkie
+            self.cols_to_poly = valid_cols
+
+        # Inicjalizacja transformatora na wybranych kolumnach
+        # degree=2, interaction_only=True -> tworzy tylko A*B
+        self.poly_transformer = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+        X_poly_out = self.poly_transformer.fit_transform(X[self.cols_to_poly])
+
         self.cols_to_poly_new_names = self.poly_transformer.get_feature_names_out(self.cols_to_poly)
         
-        # Tworzymy DataFrame i łączymy z oryginałem
-        # Uwaga: PolynomialFeatures zwraca też oryginalne kolumny (x, y), a potem (x*y).
-        # Żeby nie dublować, bierzemy tylko te nowe, które mają znak mnożenia " " (spacja w sklearn) lub "*"
-        
+        # Tworzymy DataFrame
         X_poly_df = pd.DataFrame(X_poly_out, columns=self.cols_to_poly_new_names, index=X.index)
         
         # Filtrujemy, żeby zostawić tylko nowe interakcje (te, których nie ma w X)
@@ -408,18 +429,16 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         if new_cols:
             X = pd.concat([X, X_poly_df[new_cols]], axis=1)
             self.num_cols.extend(new_cols)
+            print(f"--- Interakcje: Dodano {len(new_cols)} nowych cech wielomianowych ---")
             
         return X
 
 
-    def _transform_interactions(self, X):
+    def _transform_poly_features(self, X):
         """Transformacja interakcji przy użyciu wyuczonego transformatora."""
-        if not self.add_poly_features or self.poly_transformer is None:
+        if not self.add_poly_features or self.poly_transformer is None or not self.cols_to_poly:
             return X
         
-        if not self.cols_to_poly:
-            return X
-
         X_poly_in = X[self.cols_to_poly].values
         
         # Transformacja
@@ -523,7 +542,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
     def _fit_feature_selection(self, X, y):
         """
         Inteligentna selekcja cech:
-        1. ENSEMBLE SCREENING (L1 + ExtraTrees):
+        1. ENSEMBLE SCREENING (L2 + ExtraTrees):
         - Usuwa zmienne, które są słabe ZARÓWNO liniowo, jak i nieliniowo.
         - To jest 'miękkie' wstępne czyszczenie.
         2. HYBRYDOWA REDUKCJA:
@@ -540,7 +559,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         n_start = len(initial_cols)
         
         # Próg przełączenia między SFS a PCA
-        SFS_CAP_THRESHOLD = 50
+        SFS_CAP_THRESHOLD = 75
 
         # ==========================================
         # ETAP 1: ENSEMBLE SCREENING (L1 + ExtraTrees)
@@ -551,15 +570,26 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             # A. Ocena Liniowa (L1 / Lasso)
             # C=0.5 to umiarkowana regularyzacja. threshold='0.1*mean' jest bardzo łagodny.
             # Chcemy wyrzucić tylko totalne zera.
-            l1_model = LogisticRegression(penalty='l1', C=0.5, solver='liblinear', random_state=self.random_state, class_weight='balanced')
-            l1_selector = SelectFromModel(estimator=l1_model, threshold="0.1*mean")
+            print("   -> Ocena Liniowa (L1 Logistic Regression)...")
+            LR_threshold = "0.1*mean"  # próg
+            l1_model = LogisticRegression(
+                class_weight = 'balanced', 
+                penalty = 'l1',
+                solver='liblinear',
+                max_iter = 100,
+                C = 0.5,
+                tol = 1e-3,
+                random_state = self.random_state
+            )
+            l1_selector = SelectFromModel(estimator=l1_model, threshold=LR_threshold)
             l1_selector.fit(X_curr, y)
             mask_l1 = l1_selector.get_support()
             
             # B. Ocena Nieliniowa (ExtraTrees)
             # Drzewa widzą interakcje.
-            ETC_threshold = "0.25*mean"  # próg
-            et_model = ExtraTreesClassifier(n_estimators=75, min_samples_leaf=7, random_state=self.random_state, n_jobs=-1, class_weight='balanced')
+            print("   -> Ocena Nieliniowa (ExtraTreesClassifier)...")
+            ETC_threshold = "0.34*mean"  # próg
+            et_model = ExtraTreesClassifier(n_estimators=75, min_samples_leaf=10, random_state=self.random_state, n_jobs=-1, class_weight='balanced')
             et_selector = SelectFromModel(estimator=et_model, threshold=ETC_threshold)
             et_selector.fit(X_curr, y)
             mask_et = et_selector.get_support()
@@ -601,14 +631,21 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
             self.selection_mode = 'sfs'
             
-            est = LogisticRegression(class_weight='balanced', solver='liblinear', random_state=self.random_state)
+            est = LogisticRegression(
+                class_weight='balanced', 
+                solver='liblinear',
+                max_iter= 100,
+                C=0.5,
+                tol=1e-5,
+                random_state=self.random_state
+            )
             
             self.selector_model = SFS(
                 est,
-                k_features='best', # parsimonious
+                k_features='parsimonious', # best lub parsimonious
                 forward=False, 
                 floating=False, 
-                verbose=2,  # <--- TU JEST OPCJA VERBOSE (2 = szczegółowa)
+                verbose=1,  # (2 = szczegółowa)
                 scoring='roc_auc',
                 cv=3,
                 n_jobs=-1
@@ -631,7 +668,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
             # AUTOMATYCZNY DOBÓR:
             # To eliminuje współliniowość i szum, ale zostawia prawie cały sygnał.
-            target_variance = 0.99
+            target_variance = 0.999
             
             # Bezpiecznik: PCA nie może stworzyć więcej komponentów niż mamy próbek
             # (choć sklearn z floatem i tak by to obsłużył, svd_solver='full' jest precyzyjny)
@@ -759,7 +796,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         # B. Interakcje (na podstawie num_cols + kmeans_cols)
         if self.add_poly_features:
             self.poly_transformer = None 
-            X = self._add_interactions(X)
+            X = self._add_poly_features(X, y_proc)
 
         # --- 3. Czyszczenie (Współliniowość) ---
         # Robimy to PO wygenerowaniu wszystkiego, żeby usunąć np. interakcje skorelowane z oryginałem
@@ -788,26 +825,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
         X = self._process_dates_cyclical(X)
         
-        # Imputacja/Skalowanie (tylko dla kolumn z num_cols, które przetrwały w fit)
-        # Uwaga: valid_num musi sprawdzać self.num_cols, które w fit() zostały już "oczyszczone"
-        # z kolumn współliniowych. Jednak w surowym X te kolumny wciąż są.
-        # Dlatego najpierw przetwarzamy to co mamy w X, a potem dropujemy.
-        
-        # Musimy wiedzieć które kolumny numeryczne przetworzyć.
-        # Imputery mają zapisane swoje kolumny (feature_names_in_ w nowszych sklearn),
-        # ale my używamy self.num_cols. 
-        # Trikiem jest to, że self.num_cols w fit() zostało pomniejszone o collinear_drop_cols.
-        # Ale imputery były uczone NA PEŁNYM zestawie przed dropowaniem.
-        
-        # Bezpieczniej jest użyć kolumn na których imputery były uczone:
-        # if hasattr(self.imputer_num, "feature_names_in_"):
-        #      cols_to_impute = self.imputer_num.feature_names_in_
-        # else:
-        #      # Fallback jeśli starszy sklearn - bierzemy te z X co pasują do typów numerycznych
-        #      # (to uproszczenie, ale zazwyczaj działa)
-        #      cols_to_impute = X.select_dtypes(include=['number']).columns
-        
-        # Filtrujemy tylko te które są w obecnym X
+        # --- Imputacja, Skalowanie, Encoding ---
         valid_impute = [c for c in self.cols_to_impute_num if c in X.columns]
         if len(valid_impute) > 0:
             X[valid_impute] = self.imputer_num.transform(X[valid_impute])
@@ -825,7 +843,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             X = self._transform_with_kmeans(X)
 
         if self.add_poly_features:
-            X = self._transform_interactions(X)
+            X = self._transform_poly_features(X)
 
         # --- Czyszczenie (Współliniowość) ---
         if self.remove_multicollinearity and self.collinear_drop_cols:
