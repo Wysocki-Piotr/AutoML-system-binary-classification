@@ -239,195 +239,185 @@ class MiniAutoML:
         ).reset_index(drop=True)
 
         # ======================================================================
-        # STAGE 2: STACKING (TWÓJ ORYGINALNY KOD)
+        # STAGE 2: STACKING (BEST + UNIQUE)
         # ======================================================================
-        print("\n--- Stage 2: Stacking Ensemble (Original) ---")
+        print("\n--- Stage 2: Stacking Ensembles ---")
 
-        # Zapisujemy OOF z tej fazy, żeby nie liczyć ich drugi raz w fazie 3 (optymalizacja czasu)
         oof_cache = {}
-        base_wrappers_stacking = []  # Wrappery stworzone w tej fazie
 
-        selected = leaderboard.head(3).to_dict("records")
+        # --- Funkcja pomocnicza do pobierania/liczenia OOF ---
+        def get_or_calc_oof(row_data):
+            m_name = row_data["Model Name"]
+            if m_name in oof_cache:
+                return oof_cache[m_name]
 
-        meta_features = []
-        ensemble_base_params = {}
 
-        for row in selected:
-            wrapper = row["Wrapper"]
-            model_name = row["Model Name"]
-            ensemble_base_params[model_name] = row["Params"]
-
-            X_current = X_train_proc
-            if ("XGBClassifier" in row["Config"]["class"] or "LGBMClassifier" in row["Config"]["class"]) and cat_cols:
-                X_current = X_train_cat
+            wrapper = row_data["Wrapper"]
+            X_curr = X_train_proc
+            if ("XGBClassifier" in row_data["Config"]["class"] or "LGBMClassifier" in row_data["Config"][
+                "class"]) and cat_cols:
+                X_curr = X_train_cat
 
             try:
-                oof_proba = cross_val_predict(wrapper.model, X_current, y_train, cv=cv, method="predict_proba",
-                                              n_jobs=-1)[:, 1]
+                oof = cross_val_predict(wrapper.model, X_curr, y_train, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
             except:
-                oof_proba = cross_val_predict(wrapper.model, X_current, y_train, cv=cv, method="predict", n_jobs=-1)
+                oof = cross_val_predict(wrapper.model, X_curr, y_train, cv=cv, method="predict", n_jobs=-1)
 
-            oof_cache[model_name] = oof_proba
-            meta_features.append(oof_proba)
+            oof_cache[m_name] = oof
+            return oof
 
-            new_wrapper = ModelWrapper(row["Config"])
-            new_wrapper.model.set_params(**wrapper.model.get_params())
-            base_wrappers_stacking.append(new_wrapper)
+        # --- A. STACKING TOP 3 BEST  ---
+        selected_best = leaderboard.head(3).to_dict("records")
 
-        X_meta = np.column_stack(meta_features)
+        if len(selected_best) >= 2:
+            meta_feats_best = []
+            wrappers_best = []
 
-        meta_model = LogisticRegression(class_weight="balanced", solver="lbfgs", max_iter=1000)
+            for row in selected_best:
+                oof = get_or_calc_oof(row)
+                meta_feats_best.append(oof)
 
-        # Optymalizacja C (Twój kod)
-        best_meta_score = -np.inf
-        best_C = 1.0
-        for C in [0.1, 1.0, 10.0, 100, 50, 200]:
-            meta_model.set_params(**{'C': C})
-            sc = cross_val_score(meta_model, X_meta, y_train, cv=3, scoring="balanced_accuracy").mean()
-            if sc > best_meta_score:
-                best_meta_score = sc
-                best_C = C
+                nw = ModelWrapper(row["Config"])
+                nw.model.set_params(**row["Wrapper"].model.get_params())
+                wrappers_best.append(nw)
 
-        meta_model.set_params(**{'C': best_C})
-        meta_model.fit(X_meta, y_train)
+            X_meta_best = np.column_stack(meta_feats_best)
 
-        # Optymalizacja Progu (Twój kod)
-        meta_proba_train = meta_model.predict_proba(X_meta)[:, 1]
-        best_thr = 0.5
-        best_thr_score = -np.inf
-        for thr in np.linspace(0.2, 0.8, 50):
-            preds = (meta_proba_train >= thr).astype(int)
-            ba = balanced_accuracy_score(y_train, preds)
-            if ba > best_thr_score:
-                best_thr_score = ba
-                best_thr = thr
 
-        ensemble = StackingEnsemble(
-            base_models=base_wrappers_stacking,
-            preprocessor=self.preprocessor,
-            meta_model=meta_model,
-            threshold=best_thr,
-            refit_meta=False
-        )
+            meta_best = LogisticRegression(class_weight="balanced")
+            meta_best.fit(X_meta_best, y_train)
+            score_best = balanced_accuracy_score(y_train, meta_best.predict(X_meta_best))
 
-        ensemble_full_params = {
-            "type": "ensemble_detailed",
-            "meta_params": {"C": best_C, "threshold": best_thr},
-            "base_models_params": ensemble_base_params
-        }
+            scores.append({
+                "Model Name": "Ensemble: Stacking Top 3 Best",
+                "Model Class": "Ensemble",
+                "Metric Score": score_best,
+                "Wrapper": StackingEnsemble(wrappers_best, self.preprocessor, meta_best, refit_meta=False),
+                "Config": {}, "Params": "Stacking Top 3 Best"
+            })
+            print(f"Stacking Top 3 Best → {score_best:.4f}")
 
-        scores.append({
-            "Model Name": "Stacking Ensemble",
-            "Model Class": "Ensemble",
-            "Metric Score": best_thr_score,
-            "Wrapper": ensemble,
-            "Config": {},
-            "Params": ensemble_full_params
-        })
-        print(f"Stacking Ensemble added (Score: {best_thr_score:.4f})")
+        # --- B. STACKING TOP 3 UNIQUE  ---
+        unique_candidates = []
+        seen_classes = set()
+
+        for row in leaderboard.to_dict("records"):
+            m_class = row["Config"]["class"]
+            if m_class not in seen_classes:
+                unique_candidates.append(row)
+                seen_classes.add(m_class)
+
+            if len(unique_candidates) >= 3:
+                break
+
+        if len(unique_candidates) >= 2:
+            meta_feats_unique = []
+            wrappers_unique = []
+            names_unique = []
+
+            for row in unique_candidates:
+                names_unique.append(row["Model Name"])
+                oof = get_or_calc_oof(row)
+                meta_feats_unique.append(oof)
+
+                nw = ModelWrapper(row["Config"])
+                nw.model.set_params(**row["Wrapper"].model.get_params())
+                wrappers_unique.append(nw)
+
+            X_meta_unique = np.column_stack(meta_feats_unique)
+
+            meta_unique = LogisticRegression(class_weight="balanced")
+            meta_unique.fit(X_meta_unique, y_train)
+            score_unique = balanced_accuracy_score(y_train, meta_unique.predict(X_meta_unique))
+
+            scores.append({
+                "Model Name": "Ensemble: Stacking Top 3 Unique",
+                "Model Class": "Ensemble",
+                "Metric Score": score_unique,
+                "Wrapper": StackingEnsemble(wrappers_unique, self.preprocessor, meta_unique, refit_meta=False),
+                "Config": {}, "Params": f"Unique Models: {names_unique}"
+            })
+            print(f"Stacking Top 3 Unique → {score_unique:.4f} (Models: {len(unique_candidates)})")
 
         # ======================================================================
-        # STAGE 3: HEURISTIC ENSEMBLES
+        # STAGE 3: HEURISTIC ENSEMBLES (Mean, Rank, Champ+Rebel)
         # ======================================================================
         print("\n--- Stage 3: Fast Heuristics (Top 5) ---")
 
-        selected_heuristics = leaderboard.head(5).to_dict("records")
+        top_n = min(5, len(leaderboard))
+        selected_heuristics = leaderboard.head(top_n).to_dict("records")
 
         heuristic_wrappers = []
         collected_oofs = []
-        names_in_heuristic = []
 
-        # 1. Zbieranie OOF (pobieramy z cache lub doliczamy brakujące dla poz. 4 i 5)
         for row in selected_heuristics:
-            name = row["Model Name"]
-            wrapper = row["Wrapper"]
-            names_in_heuristic.append(name)
+            oof = get_or_calc_oof(row)  # Pobiera z cache lub liczy
+            collected_oofs.append(oof)
 
             nw = ModelWrapper(row["Config"])
-            nw.model.set_params(**wrapper.model.get_params())
+            nw.model.set_params(**row["Wrapper"].model.get_params())
             heuristic_wrappers.append(nw)
 
-            if name in oof_cache:
-                collected_oofs.append(oof_cache[name])
-            else:
-                print(f"  -> Calculating OOF for {name}...")
-                X_current = X_train_proc
-                if ("XGBClassifier" in row["Config"]["class"] or "LGBMClassifier" in row["Config"][
-                    "class"]) and cat_cols:
-                    X_current = X_train_cat
-                try:
-                    oof = cross_val_predict(wrapper.model, X_current, y_train, cv=cv, method="predict_proba",
-                                            n_jobs=-1)[:, 1]
-                except:
-                    oof = cross_val_predict(wrapper.model, X_current, y_train, cv=cv, method="predict", n_jobs=-1)
-                collected_oofs.append(oof)
-                oof_cache[name] = oof
+        X_heuristics = np.column_stack(collected_oofs)
 
-        X_heuristics = np.column_stack(collected_oofs)  # Matrix: (Samples, 5)
-
-        # POMYSŁ 1: Simple Mean Top 5
+        # 1. Simple Mean
         mean_preds = np.mean(X_heuristics, axis=1)
         score_mean = balanced_accuracy_score(y_train, (mean_preds >= 0.5).astype(int))
         scores.append({
-            "Model Name": f"Ensemble: Mean Top {5}",
+            "Model Name": f"Ensemble: Mean Top {top_n}",
             "Model Class": "Heuristic",
             "Metric Score": score_mean,
             "Wrapper": HeuristicEnsemble(heuristic_wrappers, self.preprocessor, mode="mean"),
             "Config": {}, "Params": "Simple Mean"
         })
-        print(f"Ensemble: Mean Top {5} → {score_mean:.4f}")
+        print(f"Ensemble: Mean Top {top_n} → {score_mean:.4f}")
 
-        # POMYSŁ 2: Rank Averaging Top 5
+        # 2. Rank Avg
         ranked_preds = np.apply_along_axis(lambda x: rankdata(x) / len(x), 0, X_heuristics)
         mean_rank = np.mean(ranked_preds, axis=1)
         score_rank = balanced_accuracy_score(y_train, (mean_rank >= 0.5).astype(int))
         scores.append({
-            "Model Name": f"Ensemble: Rank Avg Top {5}",
+            "Model Name": f"Ensemble: Rank Avg Top {top_n}",
             "Model Class": "Heuristic",
             "Metric Score": score_rank,
             "Wrapper": HeuristicEnsemble(heuristic_wrappers, self.preprocessor, mode="rank"),
             "Config": {}, "Params": "Rank Averaging"
         })
-        print(f"Ensemble: Rank Avg Top {5} → {score_rank:.4f}")
+        print(f"Ensemble: Rank Avg Top {top_n} → {score_rank:.4f}")
 
-        # POMYSŁ 3: Champion + Rebel (Best + Uncorrelated from Top 5
-        champ_idx = 0
-        champ_oof = collected_oofs[champ_idx]
+        # 3. Champ + Rebel
+        if top_n >= 2:
+            champ_oof = collected_oofs[0]  # #1 model
+            best_rebel_idx = -1
+            min_corr = 1.0
 
-        best_rebel_idx = -1
-        min_corr = 1.0
+            for i in range(1, top_n):
+                corr = np.corrcoef(champ_oof, collected_oofs[i])[0, 1]
+                if corr < min_corr:
+                    min_corr = corr
+                    best_rebel_idx = i
 
+            if best_rebel_idx != -1:
+                rebel_oof = collected_oofs[best_rebel_idx]
+                blend_oof = 0.7 * champ_oof + 0.3 * rebel_oof
+                score_blend = balanced_accuracy_score(y_train, (blend_oof >= 0.5).astype(int))
 
-        for i in range(1, 5):
-            corr = np.corrcoef(champ_oof, collected_oofs[i])[0, 1]
-            if corr < min_corr:
-                min_corr = corr
-                best_rebel_idx = i
+                blend_wrapper = HeuristicEnsemble(
+                    [heuristic_wrappers[0], heuristic_wrappers[best_rebel_idx]],
+                    self.preprocessor, mode="weighted", weights=[0.7, 0.3]
+                )
 
-        if best_rebel_idx != -1:
-            rebel_oof = collected_oofs[best_rebel_idx]
-
-            blend_oof = 0.7 * champ_oof + 0.3 * rebel_oof
-            score_blend = balanced_accuracy_score(y_train, (blend_oof >= 0.5).astype(int))
-
-            blend_wrapper = HeuristicEnsemble(
-                [heuristic_wrappers[champ_idx], heuristic_wrappers[best_rebel_idx]],
-                self.preprocessor,
-                mode="weighted",
-                weights=[0.7, 0.3]
-            )
-
-            scores.append({
-                "Model Name": f"Ensemble: Champ+Rebel (Corr {min_corr:.2f})",
-                "Model Class": "Heuristic",
-                "Metric Score": score_blend,
-                "Wrapper": blend_wrapper,
-                "Config": {}, "Params": "Weighted 0.7/0.3"
-            })
-            print(f"Ensemble: Champ+Rebel → {score_blend:.4f}")
+                scores.append({
+                    "Model Name": "Ensemble: Champ+Rebel",
+                    "Model Class": "Heuristic",
+                    "Metric Score": score_blend,
+                    "Wrapper": blend_wrapper,
+                    "Config": {}, "Params": f"Champ & #{best_rebel_idx + 1} (Corr {min_corr:.2f})"
+                })
+                print(f"Ensemble: Champ+Rebel → {score_blend:.4f}")
 
         # ======================================================================
-        # FINAL SELECTION (Standardowy kod)
+        # FINAL SELECTION
         # ======================================================================
         leaderboard = pd.DataFrame(scores).sort_values(
             by="Metric Score", ascending=False
@@ -440,22 +430,14 @@ class MiniAutoML:
         print("\n==============================")
         print(f"WINNER: {best['Model Name']}")
         print(f"Balanced Accuracy: {best['Metric Score']:.4f}")
-        print("------------------------------")
-
-        # Logowanie parametrów...
-        if isinstance(best["Params"], dict):
-            pass  # Twoje logowanie
-        else:
-            print(best["Params"])
-
         print("==============================")
+
         print(f"Final fitting of {best['Model Name']}...")
 
-        # Logika final fit - obsługa Ensemble vs Single
+        # Fit logic
         if isinstance(self.best_model, StackingEnsemble):
             self.best_model.fit(X_train_proc, y_train)
         elif isinstance(self.best_model, HeuristicEnsemble):
-            # Heuristic tylko fituje swoje modele bazowe
             for w in self.best_model.base_models:
                 m_class = w.model.__class__.__name__
                 if ("XGBClassifier" in m_class or "LGBMClassifier" in m_class) and cat_cols:
@@ -466,7 +448,6 @@ class MiniAutoML:
                 else:
                     w.model.fit(X_train_proc, y_train)
         else:
-            # Single model
             model_class = best["Config"]["class"]
             if ("XGBClassifier" in model_class or "LGBMClassifier" in model_class) and cat_cols:
                 self.best_model.fit(X_train_cat, y_train)
