@@ -4,7 +4,7 @@
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
       "C": 758.6397627599249,
-      "max_iter": 5000
+      "max_iter": 10000
     }
   },
   {
