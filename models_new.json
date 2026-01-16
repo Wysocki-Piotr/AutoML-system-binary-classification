@@ -3,8 +3,7 @@
     "name": "log_reg_tabarena_1",
     "class": "sklearn.linear_model.LogisticRegression",
     "params": {
-      "C": 758.6397627599249,
-      "penalty": "l2"
+      "C": 758.6397627599249
     }
   },
   {
@@ -14,6 +13,34 @@
       "C": 857.9598230609945,
       "penalty": "l1",
       "solver": "saga"
+    }
+  },
+  {
+    "name": "log_reg_tabarena_3",
+    "class": "sklearn.linear_model.LogisticRegression",
+    "params": {
+      "C": 0.5532924805500281,
+      "penalty": "l2"
+    }
+  },
+  {
+    "name": "log_reg_tabarena_4",
+    "class": "sklearn.linear_model.LogisticRegression",
+    "params": {
+      "C": 0.630957344480131,
+      "penalty": "l1",
+      "solver": "liblinear",
+      "max_iter": 1000
+    }
+  },
+  {
+    "name": "log_reg_tabarena_4",
+    "class": "sklearn.linear_model.LogisticRegression",
+    "params": {
+      "penalty": "elasticnet",
+      "solver": "saga",
+      "max_iter": 1000,
+      "tol": 0.001
     }
   },
   {

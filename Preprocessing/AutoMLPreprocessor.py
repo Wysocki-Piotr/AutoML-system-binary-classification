@@ -119,9 +119,8 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
 
         # --- Nowe pola dla interakcji ---
         self.add_poly_features = add_poly_features
-        self.poly_transformer = None
         self.cols_to_poly = [] # Lista kolumn do interakcji
-        self.cols_to_poly_new_names = [] # Nazwy nowych cech z interakcji
+        self.added_poly_cols = [] # Nazwy nowych cech z interakcji
 
         # Target processing
         self.imputer_y = SimpleImputer(strategy='most_frequent')
@@ -227,7 +226,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             # Jeśli wartości jest mniej niż 10, traktujemy jako kategorię.
             # Dotyczy to intów, floatów, booli i stringów.
             # dropna=True -> nie liczymy NaN jako unikalnej wartości
-            if series.nunique(dropna=True) < 10:
+            if series.nunique(dropna=True) < 15:
                 self.cat_cols.append(col)
                 continue
             
@@ -374,7 +373,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
     def _fit_binning_features(self, X):
         """Uczy się przedziałów (kwantyli) na zbiorze treningowym."""
         # Logika wyboru kolumn (np. te same co do interakcji lub top numeryczne)
-        if hasattr(self, 'cols_to_poly') and self.cols_to_poly:
+        if self.cols_to_poly:
             self.binning_cols = [c for c in self.cols_to_poly if c in X.columns]
         else:
             # Fallback: pierwsze 10 numerycznych
@@ -405,17 +404,18 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         valid_cols = [c for c in self.binning_cols if c in X.columns]
         if len(valid_cols) != len(self.binning_cols):
             # Jeśli brakuje kolumn (rzadkie), pomijamy transformację dla bezpieczeństwa
+            print("   Uwaga: Brak kolumn do Binningu w danych. Pomijam transformację Binningu.")
             return X
 
         try:
-            X_binned = self.binning_transformer.transform(X[self.binning_cols])
+            X_binned = self.binning_transformer.transform(X[self.binning_cols]).astype(int)
             
             X_bin_df = pd.DataFrame(X_binned, columns=self.binning_new_names, index=X.index)
             X = pd.concat([X, X_bin_df], axis=1)
             
         except Exception as e:
+            print(f"   Błąd transformacji Binningu: {e}")
             # W rzadkich przypadkach (np. zbyt mała wariancja w kolumnie) może rzucić błąd
-            pass
             
         return X
 
@@ -578,10 +578,10 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         X_new_feats = pd.DataFrame(new_features, index=X.index)
         
         # Filtrowanie duplikatów (jeśli już są w X - rzadkie, ale możliwe)
-        cols_to_add = [c for c in X_new_feats.columns if c not in X.columns]
+        self.added_poly_cols = [c for c in X_new_feats.columns if c not in X.columns]
         
-        if cols_to_add:
-            X = pd.concat([X, X_new_feats[cols_to_add]], axis=1)
+        if self.added_poly_cols:
+            X = pd.concat([X, X_new_feats[self.added_poly_cols]], axis=1)
             # Aktualizacja listy numerycznych (tylko w fit, ale tu robimy trick sprawdzając typ)
             # Jeśli wywołujemy to z transform(), to self.num_cols nie powinno się zmieniać trwale 
             # w sposób, który zepsułby pipeline, ale dla spójności warto wiedzieć, że to liczby.
@@ -926,7 +926,14 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         if self.cat_cols:
             X[self.cat_cols] = X[self.cat_cols].astype(str)
             self.cat_encoder.fit(X[self.cat_cols])
-            X[self.cat_cols] = self.cat_encoder.transform(X[self.cat_cols])
+            X[self.cat_cols] = self.cat_encoder.transform(X[self.cat_cols]).astype(int)
+        
+        print("DEBUG1")
+        print(X.columns)
+        print(f"Numerical: {self.num_cols}")
+        print(f"Categorical: {self.cat_cols}")
+        print(f"Date: {self.date_cols}")
+        print("END DEBUG1\n\n")
 
         # --- 2. Generowanie Cech (Feature Engineering) ---
         
@@ -937,15 +944,37 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         new_freq_cols = [c for c in X.columns if c.startswith('FREQ_')]
         self.num_cols.extend(new_freq_cols)
 
+        print("DEBUG2")
+        print(X.columns)
+        print(f"Numerical: {self.num_cols}")
+        print(f"Categorical: {self.cat_cols}")
+        print(f"Date: {self.date_cols}")
+        print("END DEBUG2\n\n")
+
         # B. KMeans
         if self.add_kmeans_features:
             self._fit_kmeans(X)
             X = self._transform_with_kmeans(X)
 
+        print("DEBUG3")
+        print(X.columns)
+        print(f"Numerical: {self.num_cols}")
+        print(f"Categorical: {self.cat_cols}")
+        print(f"Date: {self.date_cols}")
+        print("END DEBUG3\n\n")
+
         # C. Interakcje (na podstawie num_cols + kmeans_cols)
         if self.add_poly_features:
-            self.poly_transformer = None 
             X = self._add_poly_features(X, y_proc)
+            self.num_cols.extend(self.added_poly_cols)
+
+        print("DEBUG4")
+        print(X.columns)
+        print(f"Numerical: {self.num_cols}")
+        print(f"Categorical: {self.cat_cols}")
+        print(f"Date: {self.date_cols}")
+        print("END DEBUG4\n\n")
+
 
         # D. Binning (Uczymy się przedziałów i transformujemy X)
         self._fit_binning_features(X)
@@ -953,20 +982,50 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         # Aktualizacja listy numerycznej o nowe kolumny BIN_
         # (Dla modeli drzewiastych traktujemy je jako numeryczne/ordinal)
         if self.binning_new_names:
-            self.num_cols.extend(self.binning_new_names)
+            self.cat_cols.extend(self.binning_new_names)
+
+        print("DEBUG AFTER BINNING")
+        print(self.binning_new_names)
+        print("\n\n")
+
+
+        print("DEBUG5")
+        print(X.columns)
+        print(f"Numerical: {self.num_cols}")
+        print(f"Categorical: {self.cat_cols}")
+        print(f"Date: {self.date_cols}")
+        print("END DEBUG5\n\n")
+
 
         # --- 3. Czyszczenie (Współliniowość) ---
         # Robimy to PO wygenerowaniu wszystkiego, żeby usunąć np. interakcje skorelowane z oryginałem
         if self.remove_multicollinearity:
             X = self._remove_collinear(X)
         
+        print("DEBUG6")
+        print(X.columns)
+        print(f"Numerical: {self.num_cols}")
+        print(f"Categorical: {self.cat_cols}")
+        print(f"Date: {self.date_cols}")
+        print("END DEBUG6\n\n")
+
+
+
         # --- 4. Selekcja Cech ---
         if self.feature_selection:
             self._fit_feature_selection(X, y_proc)
             X = self._transform_feature_selection(X)
-            self.num_cols = [c for c in self.num_cols if c in X.columns]
-            self.cat_cols = [c for c in self.cat_cols if c in X.columns]
         self.is_fitted = True
+        
+        
+        print("DEBUG7")
+        print(X.columns)
+        print(f"Numerical: {self.num_cols}")
+        print(f"Categorical: {self.cat_cols}")
+        print(f"Date: {self.date_cols}")
+        print("END DEBUG7\n\n")
+        
+        
         return self
 
     def transform(self, X, y=None):
@@ -992,7 +1051,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         if len(valid_impute) > 0:
             X[valid_impute] = self.imputer_cat.transform(X[valid_impute])
             X[valid_impute] = X[valid_impute].astype(str)
-            X[valid_impute] = self.cat_encoder.transform(X[valid_impute])
+            X[valid_impute] = self.cat_encoder.transform(X[valid_impute]).astype(int)
 
         # --- Generowanie Cech (Kolejność jak w fit!) ---
         
