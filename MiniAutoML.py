@@ -78,9 +78,6 @@ class StackingEnsemble:
             self.meta_model.fit(X_meta, y)
         else:
             print("  -> Using pre-trained Meta-Learner params.")
-            # Jeśli meta model nie był trenowany, to musimy go tutaj nauczyć na czymś?
-            # W Twoim kodzie MiniAutoML meta_model jest już nauczony "na brudno" przed tworzeniem Ensemble.
-            # Więc tutaj zakładamy, że przekazany self.meta_model jest już .fit() z MiniAutoML.
             pass
             
         self.fitted_ = True
@@ -142,20 +139,14 @@ class MiniAutoML:
 
     def fit(self, X_train, y_train, cv=5):
         warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
-        from sklearn.experimental import enable_halving_search_cv  # noqa
-        from sklearn.model_selection import HalvingRandomSearchCV
         cv_stratedy = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
         scores = []
         n_samples, n_features = X_train.shape
         
         print("Begin preprocessing...")
         X_train_proc, y_train= self.preprocessor.fit_transform(X_train, y_train)
-
-        # dla xgboost/lightgbm konwersja kolumn kategorycznych na 'category'
-        # Pobieramy kolumny kategoryczne RAZ
         cat_cols = self.preprocessor.get_categorical_cols(X_train_proc)
 
-        # Przygotowujemy wersję "castowaną" dla XGBoost/LGBM do etapu screening
         X_train_cat = X_train_proc.copy()
         if cat_cols:
             for col in cat_cols:
@@ -204,7 +195,7 @@ class MiniAutoML:
                 "Metric Score": mean_score,
                 "Wrapper": wrapper,
                 "Config": model_config,
-                "Params": wrapper.model.get_params()  # Zapisujemy domyślne parametry
+                "Params": wrapper.model.get_params()
             })
 
             print(f"{model_config['name']} → BA = {mean_score:.4f}")
@@ -214,14 +205,14 @@ class MiniAutoML:
         ).reset_index(drop=True)
 
         # ======================================================================
-        # STAGE 3: STACKING (OPTIMIZED)
+        # STAGE 2: STACKING
         # ======================================================================
         print("\n--- Stage 3: Stacking Ensemble ---")
 
         selected = leaderboard.head(3).to_dict("records")
 
         meta_features = []
-        base_wrappers = [] # Zbieramy same obiekty Wrapper, nie słowniki
+        base_wrappers = []
         ensemble_base_params = {}
 
         for row in selected:
@@ -241,21 +232,19 @@ class MiniAutoML:
                 oof_proba = cross_val_predict(wrapper.model, X_current, y_train, cv=cv, method="predict", n_jobs=-1)
             
             meta_features.append(oof_proba)
-
-            # Kopia wrappera dla Ensemble
             new_wrapper = ModelWrapper(row["Config"])
             new_wrapper.model.set_params(**wrapper.model.get_params())
-            base_wrappers.append(new_wrapper) # Dodajemy wrapper do listy
+            base_wrappers.append(new_wrapper)
 
         X_meta = np.column_stack(meta_features)
 
         # Trening Meta Modelu
-        meta_model = LogisticRegression(class_weight="balanced", solver="lbfgs")
+        meta_model = LogisticRegression(class_weight="balanced", solver="lbfgs", max_iter=1000)
 
         # Optymalizacja C dla Meta Modelu
         best_meta_score = -np.inf
         best_C = 1.0
-        for C in [0.1, 1.0, 10.0]:
+        for C in [0.1, 1.0, 10.0,100,50,200]:
             meta_model.set_params(**{'C': C})
             sc = cross_val_score(meta_model, X_meta, y_train, cv=3, scoring="balanced_accuracy").mean()
             if sc > best_meta_score:
@@ -284,7 +273,6 @@ class MiniAutoML:
             refit_meta=False 
         )
 
-        # Tworzymy strukture parametrów dla Ensemble
         ensemble_full_params = {
             "type": "ensemble_detailed",
             "meta_params": {"C": best_C, "threshold": best_thr},
@@ -297,7 +285,7 @@ class MiniAutoML:
             "Metric Score": best_thr_score,
             "Wrapper": ensemble,
             "Config": {},
-            "Params": ensemble_full_params  # Zapisujemy skomplikowaną strukturę
+            "Params": ensemble_full_params
         })
 
         # ======================================================================
@@ -316,11 +304,9 @@ class MiniAutoML:
         print(f"Balanced Accuracy: {best['Metric Score']:.4f}")
         print("------------------------------")
 
-        # LOGIKA DRUKOWANIA PARAMETRÓW
         params = best["Params"]
-
         if isinstance(params, dict) and params.get("type") == "ensemble_detailed":
-            # Wyświetlanie dla Ensemble
+
             print(">>> ENSEMBLE STRUCTURE & PARAMETERS <<<")
             print(f"  [Meta-Model] Logistic Regression:")
             print(f"      - C: {params['meta_params']['C']}")
@@ -328,18 +314,11 @@ class MiniAutoML:
             print("\n  [Base Models]:")
             for name, p_dict in params['base_models_params'].items():
                 print(f"    * {name}:")
-                # Wyświetlamy tylko kluczowe parametry (nie None), żeby nie zaśmiecać,
-                # albo wszystkie jeśli wolisz - poniżej wersja skrócona (parametry optymalizowane)
-                # Jeśli to dict z HalvingSearch, jest krótki. Jeśli full get_params(), jest długi.
-                # Wyświetlamy jako słownik w jednej linii lub ładnie sformatowany
-                import json
                 try:
-                    # Próba ładnego formatowania jeśli parametry są proste
                     print(f"      {p_dict}")
                 except:
-                    print(f"      {str(p_dict)[:200]}...")  # Przycięcie jeśli za długie
+                    print(f"      {str(p_dict)[:200]}...")
         else:
-            # Wyświetlanie dla pojedynczego modelu
             print(">>> BEST MODEL PARAMETERS <<<")
             print(params)
 
@@ -355,7 +334,6 @@ class MiniAutoML:
             model_class = best["Config"]["class"]
             
             if ("XGBClassifier" in model_class or "LGBMClassifier" in model_class) and cat_cols:
-                # Jeśli wygrał XGB/LGBM, musimy mu dać dane z kategoriami
                 self.best_model.fit(X_train_cat, y_train)
             elif "CatBoost" in model_class and cat_cols:
                  self.best_model.model.set_params(cat_features=cat_cols)
@@ -369,14 +347,10 @@ class MiniAutoML:
         if not self.best_model: raise ValueError("Call fit() first.")
 
         if isinstance(self.best_model, StackingEnsemble):
-            # Ensemble sam sobie robi transform wewnątrz predict
             return self.best_model.predict(X_test)
 
-        # Dla pojedynczego modelu musimy przetworzyć surowe dane
-        # Uwaga: używamy transform, nie fit_transform
         X_test_proc = self.preprocessor.transform(X_test, None)
-        
-        # Obsługa XGBoost przy predykcji pojedynczego modelu
+
         cat_cols = self.preprocessor.get_categorical_cols(X_test_proc)
         if ("XGBClassifier" in self.best_model.model.__class__.__name__ or 
             "LGBMClassifier" in self.best_model.model.__class__.__name__) and cat_cols:

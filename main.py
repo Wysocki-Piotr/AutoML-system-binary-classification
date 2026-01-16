@@ -5,16 +5,8 @@ from wrappers.wrapper_model import ModelWrapper
 import pandas as pd
 
 pd.set_option('display.max_columns', None)
-# Load model configurations
 cfg = pd.read_json("models_new.json").to_dict(orient="records")
 
-# Load dataset
-#data = pd.read_csv("Datasets/qsar-biodeg_46952.csv")
-data = pd.read_csv("Datasets/diabetes_46921.csv")
-#data = pd.read_csv("Datasets/Amazon_employee_access_46905.csv")
-
-X = data.drop(columns=["target"])
-y = data["target"]
 
 X = pd.read_csv("test_data/X.csv")
 y = pd.read_csv("test_data/y.csv")
@@ -27,10 +19,10 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_
 preprocessing = AutoMLPreprocessor(
                  add_kmeans_features=True,
                  feature_selection= True,
-                 add_poly_features=True, 
-                 remove_outliers=False, 
-                 remove_multicollinearity=True, 
-                 multicollinearity_threshold=0.95, 
+                 add_poly_features=True,
+                 remove_outliers=False,
+                 remove_multicollinearity=True,
+                 multicollinearity_threshold=0.95,
                  id_threshold=0.95,
                  random_state=42)
 X_train, y_train = preprocessing.fit_transform(X_train, y_train)

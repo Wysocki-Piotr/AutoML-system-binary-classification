@@ -20,11 +20,6 @@ automl = MiniAutoML(cfg, metric="balanced_accuracy")
 X = pd.read_csv("test_data/X.csv")
 y = pd.read_csv("test_data/y.csv").squeeze().astype(int)
 
-# # data = pd.read_csv("Datasets/HR_Analytics_Job_Change_of_Data_Scientists_46935.csv")
-# data = pd.read_csv("Datasets/diabetes_46921.csv")
-# X = data.drop(columns=["target"])
-# y = data["target"]
-
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 
