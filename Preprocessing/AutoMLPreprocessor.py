@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import LabelEncoder
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import KBinsDiscretizer, PolynomialFeatures, StandardScaler, PowerTransformer, OrdinalEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -12,6 +13,10 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import SelectFromModel
 from mlxtend.feature_selection import SequentialFeatureSelector as SFS
+
+from sklearn.experimental import enable_iterative_imputer  # noqa
+from sklearn.impute import IterativeImputer
+from sklearn.ensemble import ExtraTreesRegressor
 
 
 import warnings
@@ -95,11 +100,23 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         self.cols_to_drop_early = []
 
         # Imputers and transformers
-        self.imputer_num = SimpleImputer(strategy='median')
-        self.cols_to_impute_num = [] # Lista kolumn do imputacji numerycznej
+        # IterativeImputer - MICE (Multivariate Imputation by Chained Equations)
+        # Używamy ExtraTreesRegressor dla szybkości i nieliniowości.
+        self.imputer_num = IterativeImputer(
+            estimator=ExtraTreesRegressor(n_jobs=-1, min_samples_leaf=10, n_estimators=20, random_state=random_state),
+            max_iter=5,            # 5 iteracji wystarczy dla dobrego przybliżenia (szybkość)
+            random_state=random_state,
+            initial_strategy='median' # Na start wstawia medianę, potem ją poprawia drzewami
+        )
+        self.cols_to_impute_num = [] 
+
+        # Dla kategorii SimpleImputer, dla szybkości.
+        # Imputacja MICE dla kategorii jest bardzo kosztowna obliczeniowo.
         self.imputer_cat = SimpleImputer(strategy='most_frequent')
-        self.cols_to_impute_cat = [] # Lista kolumn do imputacji kategorycznej
+        self.cols_to_impute_cat = [] 
+        
         self.power_transformer = PowerTransformer(method='yeo-johnson', standardize=True)
+        # unknown_value=-1 jest bezpieczne, bo rzutujemy na int -> -1 (int)
         self.cat_encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
 
         # Frequency Encoding
@@ -693,7 +710,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         n_start = len(initial_cols)
         
         # Próg przełączenia między SFS a PCA
-        SFS_CAP_THRESHOLD = 10000
+        SFS_CAP_THRESHOLD = 150
 
         # ==========================================
         # ETAP 1: ENSEMBLE SCREENING (L1 + ExtraTrees)
@@ -770,21 +787,35 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             
             self.selection_mode = 'sfs'
             
-            est = LogisticRegression(
-                class_weight='balanced', 
-                solver='liblinear',
-                max_iter= 1000,
-                C=0.75,
-                tol=1e-3,
-                random_state=self.random_state
-            )
+            # est = LogisticRegression( # średnio wolny
+            #     class_weight='balanced', 
+            #     solver='liblinear',
+            #     max_iter= 1000,
+            #     C=0.1, # może być tunowane
+            #     #tol=1e-3,
+            #     random_state=self.random_state
+            # )
+
+            # est = ExtraTreesClassifier( # wolny
+            #     n_estimators=20, 
+            #     max_depth=7,
+            #     n_jobs=-1, 
+            #     class_weight='balanced',
+            #     random_state=self.random_state
+            # )
+
+            est = KNeighborsClassifier(n_neighbors=4, n_jobs=-1) #szybki i całkiem dobry
+
+            
+            # from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+            # est = LinearDiscriminantAnalysis()
             
             self.selector_model = SFS(
                 est,
                 k_features='best', # best lub parsimonious
                 forward=False, 
                 floating=False, 
-                verbose=1,  # (2 = szczegółowa)
+                verbose=0,  # (2 = szczegółowa)
                 scoring='roc_auc',
                 cv=3,
                 n_jobs=-1
@@ -913,6 +944,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             self.imputer_num.fit(X[self.num_cols])
             self.cols_to_impute_num = self.num_cols.copy()
             X[self.num_cols] = self.imputer_num.transform(X[self.num_cols])
+
         if self.cat_cols:
             self.imputer_cat.fit(X[self.cat_cols])
             self.cols_to_impute_cat = self.cat_cols.copy()
@@ -928,13 +960,6 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             self.cat_encoder.fit(X[self.cat_cols])
             X[self.cat_cols] = self.cat_encoder.transform(X[self.cat_cols]).astype(int)
         
-        print("DEBUG1")
-        print(X.columns)
-        print(f"Numerical: {self.num_cols}")
-        print(f"Categorical: {self.cat_cols}")
-        print(f"Date: {self.date_cols}")
-        print("END DEBUG1\n\n")
-
         # --- 2. Generowanie Cech (Feature Engineering) ---
         
         # A. Frequency Encoding (Uczymy się mapy i transformujemy X)
@@ -944,37 +969,15 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         new_freq_cols = [c for c in X.columns if c.startswith('FREQ_')]
         self.num_cols.extend(new_freq_cols)
 
-        print("DEBUG2")
-        print(X.columns)
-        print(f"Numerical: {self.num_cols}")
-        print(f"Categorical: {self.cat_cols}")
-        print(f"Date: {self.date_cols}")
-        print("END DEBUG2\n\n")
-
         # B. KMeans
         if self.add_kmeans_features:
             self._fit_kmeans(X)
             X = self._transform_with_kmeans(X)
 
-        print("DEBUG3")
-        print(X.columns)
-        print(f"Numerical: {self.num_cols}")
-        print(f"Categorical: {self.cat_cols}")
-        print(f"Date: {self.date_cols}")
-        print("END DEBUG3\n\n")
-
         # C. Interakcje (na podstawie num_cols + kmeans_cols)
         if self.add_poly_features:
             X = self._add_poly_features(X, y_proc)
             self.num_cols.extend(self.added_poly_cols)
-
-        print("DEBUG4")
-        print(X.columns)
-        print(f"Numerical: {self.num_cols}")
-        print(f"Categorical: {self.cat_cols}")
-        print(f"Date: {self.date_cols}")
-        print("END DEBUG4\n\n")
-
 
         # D. Binning (Uczymy się przedziałów i transformujemy X)
         self._fit_binning_features(X)
@@ -984,47 +987,16 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         if self.binning_new_names:
             self.cat_cols.extend(self.binning_new_names)
 
-        print("DEBUG AFTER BINNING")
-        print(self.binning_new_names)
-        print("\n\n")
-
-
-        print("DEBUG5")
-        print(X.columns)
-        print(f"Numerical: {self.num_cols}")
-        print(f"Categorical: {self.cat_cols}")
-        print(f"Date: {self.date_cols}")
-        print("END DEBUG5\n\n")
-
-
         # --- 3. Czyszczenie (Współliniowość) ---
         # Robimy to PO wygenerowaniu wszystkiego, żeby usunąć np. interakcje skorelowane z oryginałem
         if self.remove_multicollinearity:
             X = self._remove_collinear(X)
-        
-        print("DEBUG6")
-        print(X.columns)
-        print(f"Numerical: {self.num_cols}")
-        print(f"Categorical: {self.cat_cols}")
-        print(f"Date: {self.date_cols}")
-        print("END DEBUG6\n\n")
-
-
 
         # --- 4. Selekcja Cech ---
         if self.feature_selection:
             self._fit_feature_selection(X, y_proc)
             X = self._transform_feature_selection(X)
         self.is_fitted = True
-        
-        
-        print("DEBUG7")
-        print(X.columns)
-        print(f"Numerical: {self.num_cols}")
-        print(f"Categorical: {self.cat_cols}")
-        print(f"Date: {self.date_cols}")
-        print("END DEBUG7\n\n")
-        
         
         return self
 
@@ -1126,3 +1098,4 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
         # przetwarza daty, imputuje braki, skaluje i selekcjonuje cechy.
         # Działa to niezależnie od tego, czy outliery były usuwane, czy nie.
         return self.transform(X_proc, y_proc)
+    

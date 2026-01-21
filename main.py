@@ -11,6 +11,9 @@ cfg = pd.read_json("models_new.json").to_dict(orient="records")
 X = pd.read_csv("test_data/X.csv")
 y = pd.read_csv("test_data/y.csv")
 
+# data = pd.read_csv("Datasets/coil2000_insurance_policies_46916.csv")
+# X = data.drop(columns=["target"])
+# y = data["target"]
 
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -34,6 +37,9 @@ scores = []
 for model_config in cfg:
     wrapper = ModelWrapper(model_config)
     print(f"Training model: {model_config['class']}") # with parameters: {model_config.get('params', {})}")
+
+    if model_config['class'] == 'wrappers.TorchNNClassifier.TorchNNClassifier':
+        continue  # Skip TorchNNClassifier for now
 
     # Fit the model
     wrapper.fit(X_train, y_train)
