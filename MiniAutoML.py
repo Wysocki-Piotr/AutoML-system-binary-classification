@@ -52,6 +52,8 @@ class HeuristicEnsemble:
 
     def get_params(self, deep=True):
         return {"mode": self.mode}
+    
+
 class StackingEnsemble:
     def __init__(self, base_models, preprocessor, meta_model=None, threshold=0.5, refit_meta=True):
         """
@@ -462,14 +464,16 @@ class MiniAutoML:
     def predict(self, X_test):
         if not self.best_model: raise ValueError("Call fit() first.")
 
-        if isinstance(self.best_model, StackingEnsemble):
-            return self.best_model.predict(X_test)
+        if isinstance(self.best_model, (StackingEnsemble, HeuristicEnsemble)):
+            return self.best_model.predict(X_test)  
 
         X_test_proc = self.preprocessor.transform(X_test, None)
 
         cat_cols = self.preprocessor.get_categorical_cols(X_test_proc)
-        if ("XGBClassifier" in self.best_model.model.__class__.__name__ or 
-            "LGBMClassifier" in self.best_model.model.__class__.__name__) and cat_cols:
+        model_name = self.best_model.model.__class__.__name__
+
+        if ("XGBClassifier" in model_name or 
+            "LGBMClassifier" in model_name) and cat_cols:
              for col in cat_cols:
                 X_test_proc[col] = X_test_proc[col].astype("category")
                 
@@ -478,11 +482,23 @@ class MiniAutoML:
     def predict_proba(self, X_test):
         if not self.best_model: raise ValueError("Call fit() first.")
 
-        if isinstance(self.best_model, StackingEnsemble):
-            return self.best_model.predict_proba(X_test)[:, 1]
+        if isinstance(self.best_model, (StackingEnsemble, HeuristicEnsemble)):
+            preds = self.best_model.predict_proba(X_test)
+            # Obsługa różnicy między (N,) a (N, 2)
+            if preds.ndim == 2:
+                return preds[:, 1]
+            return preds
 
-        X_test = self.preprocessor.transform(X_test, None)
-        return self.best_model.predict_proba(X_test)[:, 1]
+        X_test_proc = self.preprocessor.transform(X_test, None)
+
+        cat_cols = self.preprocessor.get_categorical_cols(X_test_proc)
+        model_name = self.best_model.model.__class__.__name__
+        
+        if ("XGBClassifier" in model_name or "LGBMClassifier" in model_name) and cat_cols:
+             for col in cat_cols:
+                X_test_proc[col] = X_test_proc[col].astype("category")
+
+        return self.best_model.model.predict_proba(X_test_proc)[:, 1]
 
     def display_leaderboard(self, mode="short"):
         if self.leaderboard is None: raise ValueError("No leaderboard.")
