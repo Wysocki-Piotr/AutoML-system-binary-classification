@@ -1,4 +1,5 @@
 import numpy as np
+from sklearn.discriminant_analysis import unique_labels
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,6 +31,7 @@ class TorchNNClassifier(BaseEstimator, ClassifierMixin):
         self.batch_size = batch_size
         self.random_state = random_state
         
+        self.classes_ = None
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -55,6 +57,9 @@ class TorchNNClassifier(BaseEstimator, ClassifierMixin):
         return nn.Sequential(*layers).to(self.device)
 
     def fit(self, X, y):
+
+        self.classes_ = unique_labels(y)
+
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
             np.random.seed(self.random_state)
