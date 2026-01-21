@@ -503,7 +503,6 @@ class MiniAutoML:
 
         return self.best_model.model.predict_proba(X_test_proc)[:, 1]
 
-
     def display_leaderboard(self, mode="short"):
         if self.leaderboard is None: raise ValueError("No leaderboard.")
         print("================ Leaderboard ================")

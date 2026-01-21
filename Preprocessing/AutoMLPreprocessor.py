@@ -233,49 +233,67 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             except (ValueError, TypeError):
                 continue
         
-        # Ustalamy co zostało do sprawdzenia
-        remaining_cols = [c for c in temp_X.columns if c not in self.date_cols]
         
+        remaining_cols = [c for c in temp_X.columns if c not in self.date_cols]
+        n_rows = len(temp_X)
+
         for col in remaining_cols:
             series = temp_X[col]
             
-            # 2. Reguła MAŁEJ LICZNOŚCI (Low Cardinality)
-            # Jeśli wartości jest mniej niż 10, traktujemy jako kategorię.
-            # Dotyczy to intów, floatów, booli i stringów.
-            # dropna=True -> nie liczymy NaN jako unikalnej wartości
-            if series.nunique(dropna=True) < 15:
+            # Pomijamy puste kolumny
+            if series.dropna().empty:
+                continue
+
+            # A. Sprawdzenie typu obiektowego / bool
+            # Jeśli to stringi lub boole -> KATEGORIA
+            if pd.api.types.is_object_dtype(series) or pd.api.types.is_bool_dtype(series) or pd.api.types.is_categorical_dtype(series):
                 self.cat_cols.append(col)
                 continue
-            
-            # 3. Typy wbudowane NUMERYCZNE (int, float)
-            # Skoro ma >= 10 unikalnych i jest liczbą, to zostaje liczbą.
+
+            # B. Sprawdzenie NUMERYCZNE (int i float)
             if pd.api.types.is_numeric_dtype(series):
-                self.num_cols.append(col)
-                continue
-            
-            # 4. Wykrywanie LICZB UKRYTYCH W TEKŚCIE (np. "12.5", "-100")
-            # is_numeric() nie łapie floatów i minusów, to_numeric jest lepsze.
-            try:
-                # errors='coerce' zamieni tekst na NaN. 
-                # Sprawdzamy czy nie przybyło nam NaN-ów w porównaniu do oryginału.
-                converted = pd.to_numeric(series, errors='coerce')
                 
-                initial_nans = series.isna().sum()
-                new_nans = converted.isna().sum()
+                # 1. Test na "Prawdziwy Float"
+                # Jeśli kolumna jest floatem i ma wartości po przecinku (np. 1.23), to NA PEWNO liczba.
+                # (np. stopy procentowe, waga, cena)
+                if pd.api.types.is_float_dtype(series):
+                    # Sprawdzamy czy ma część ułamkową inną niż 0
+                    # dropna() ważne, bo modulo z NaN daje NaN
+                    if (series.dropna() % 1 != 0).any():
+                        self.num_cols.append(col)
+                        continue
+
+                # 2. Analiza Liczności (Cardinality) dla liczb całkowitych (i floatów wyglądających jak int)
+                n_unique = series.nunique(dropna=True)
                 
-                if initial_nans == new_nans:
-                    # Udało się skonwertować wszystko bez błędów -> to jest liczba
-                    self.num_cols.append(col)
-                    # (Opcjonalnie można by tu od razu nadpisać X[col], ale detect ma tylko wykrywać)
-                else:
-                    # Przybyło błędów konwersji -> to jest tekst
+                # Próg absolutny (dla małych zbiorów wartości, np. płeć 0/1, status 1/2/3)
+                ABS_THRESHOLD = 20 
+                
+                # Próg relatywny (dla dużych danych)
+                # Jeśli unikalnych wartości jest mniej niż 5% liczby wierszy -> KATEGORIA
+                # (np. kod pocztowy w bazie milionowej - jest liczbą, ale zachowuje się jak kategoria)
+                RATIO_THRESHOLD = 0.05 
+                
+                # Wyjątek: Jeśli unikalnych wartości jest bardzo dużo (np. > 1000), 
+                # to nawet przy małym ratio wolimy to jako liczbę (chyba że to ID, ale ID usuwamy gdzie indziej).
+                MAX_CAT_LIMIT = 500
+
+                if n_unique <= ABS_THRESHOLD:
+                    # Bardzo mało wartości (np. 0-20) -> Traktujemy jako KATEGORIĘ
+                    # (Dla CatBoost/LGBM to często lepsze niż liczba)
                     self.cat_cols.append(col)
-            except Exception:
-                # W razie jakiegokolwiek innego błędu -> kategoria
+                
+                elif n_unique < n_rows * RATIO_THRESHOLD and n_unique <= MAX_CAT_LIMIT:
+                    # Mało wartości w stosunku do wielkości danych -> KATEGORIA
+                    self.cat_cols.append(col)
+                
+                else:
+                    # W przeciwnym razie -> LICZBA
+                    self.num_cols.append(col)
+
+            else:
+                # Fallback (rzadkie przypadki) -> Kategoria
                 self.cat_cols.append(col)
-        self.original_num_cols = self.num_cols.copy()
-        # Logowanie dla pewności
-        # print(f"DEBUG: Daty: {len(self.date_cols)}, Kat: {len(self.cat_cols)}, Num: {len(self.num_cols)}")
 
     def _process_dates_cyclical(self, df):
         df_out = df.copy()
@@ -704,7 +722,7 @@ class AutoMLPreprocessor(BaseEstimator, TransformerMixin):
             self.selection_mode = None
             return
 
-        print(f"\n--- Inteligentna Selekcja Cech (Hybrid) ---")
+        print(f"\n--- Selekcja Cech (Hybrid) ---")
         X_curr = X.copy()
         initial_cols = X_curr.columns.tolist()
         n_start = len(initial_cols)
