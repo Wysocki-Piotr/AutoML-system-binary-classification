@@ -258,6 +258,9 @@ class MiniAutoML:
                 "class"]) and cat_cols:
                 X_curr = X_train_cat
 
+                if "XGBClassifier" in row_data["Config"]["class"]:
+                    wrapper.model.set_params(enable_categorical=True, tree_method="hist")
+
             try:
                 oof = cross_val_predict(wrapper.model, X_curr, y_train, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
             except:
@@ -351,7 +354,7 @@ class MiniAutoML:
         collected_oofs = []
 
         for row in selected_heuristics:
-            oof = get_or_calc_oof(row)  # Pobiera z cache lub liczy
+            oof = get_or_calc_oof(row)
             collected_oofs.append(oof)
 
             nw = ModelWrapper(row["Config"])
@@ -462,7 +465,7 @@ class MiniAutoML:
     def predict(self, X_test):
         if not self.best_model: raise ValueError("Call fit() first.")
 
-        if isinstance(self.best_model, StackingEnsemble):
+        if isinstance(self.best_model, StackingEnsemble) or isinstance(self.best_model, HeuristicEnsemble):
             return self.best_model.predict(X_test)
 
         X_test_proc = self.preprocessor.transform(X_test, None)
@@ -476,10 +479,14 @@ class MiniAutoML:
         return self.best_model.model.predict(X_test_proc)
 
     def predict_proba(self, X_test):
-        if not self.best_model: raise ValueError("Call fit() first.")
+        if not self.best_model:
+            raise ValueError("Call fit() first.")
 
-        if isinstance(self.best_model, StackingEnsemble):
+        if isinstance(self.best_model, StackingEnsemble) :
             return self.best_model.predict_proba(X_test)[:, 1]
+
+        if isinstance(self.best_model, HeuristicEnsemble):
+            return self.best_model.predict_proba(X_test)
 
         X_test = self.preprocessor.transform(X_test, None)
         return self.best_model.predict_proba(X_test)[:, 1]
