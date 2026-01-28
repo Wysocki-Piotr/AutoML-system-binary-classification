@@ -1,1 +1,2 @@
-# AutoML-system-binary-classification
+# MaluchML 
+AutoML-system-binary-classification
